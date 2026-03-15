@@ -1,0 +1,35 @@
+# docker-compose.override.yml
+# Adds a read-only mount so Immich can scan the Google Photos library from the NAS.
+# In the Immich web UI, add "/usr/src/app/external/google-photos" as an External Library.
+services:
+  immich-server:
+    volumes:
+      - "/Volumes/nas/Google Photos/Radu:/usr/src/app/external/google-photos:ro"
+    deploy:
+      resources:
+        limits:
+          cpus: "6"
+          memory: 3G
+        reservations:
+          cpus: "4"
+          memory: 2G
+
+  immich-machine-learning:
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 3G
+        reservations:
+          cpus: "2"
+          memory: 2G
+
+  database:
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1G
+        reservations:
+          cpus: "1"
+          memory: 512M

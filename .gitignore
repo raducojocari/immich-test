@@ -1,0 +1,23 @@
+# Immich configuration — contains credentials
+output/install/.env
+output/install/postgres/
+
+# Operational logs (cleared on each run)
+logs/
+
+# Import checkpoint log — contains personal file paths
+output/import.log
+
+# Historical operational logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Test tooling
+tests/.bats-core/

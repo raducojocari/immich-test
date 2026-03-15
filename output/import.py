@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+# import.py - Imports Google Photos Takeout archives into Immich.
+#
+# Usage:
+#   IMMICH_API_KEY=<key> python3 output/import.py --test   # Upload 5 sample files
+#   IMMICH_API_KEY=<key> python3 output/import.py --all    # Upload all photos and videos
+#
+# The script is safe to re-run — files already in the log are skipped without
+# touching the NAS, so it resumes cleanly after a crash or interruption.
+#
+# Tuning (set as env vars):
+#   IMMICH_PARALLEL=14          concurrent uploads (default: 14)
+#   IMMICH_TEST_COUNT=5         files for --test mode (default: 5)
+#   IMMICH_LARGE_MB=99          files larger than this are skipped (default: 99)
+#   PRECHECKER_BATCH_SIZE=50    files per bulk-upload-check batch (default: 50)
+
+import os
+import sys
+import json
+import hashlib
+import base64
+import datetime
+import threading
+import time
+import re
+import signal
+import logging
+import pathlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.client import HTTPConnection
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
+
+PHOTOS_DIR      = os.environ.get("IMMICH_PHOTOS_DIR", "/Volumes/nas/Google Photos/Radu")
+IMMICH_URL      = os.environ.get("IMMICH_URL", "http://localhost:2283")
+TEST_COUNT      = int(os.environ.get("IMMICH_TEST_COUNT", "5"))
+LOG_FILE        = str(SCRIPT_DIR / "import.log")
+MAX_PARALLEL    = int(os.environ.get("IMMICH_PARALLEL", "14"))
+LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
+BATCH_SIZE      = int(os.environ.get("PRECHECKER_BATCH_SIZE", "50"))
+PROGRESS_INTERVAL = 50
+
+MEDIA_EXTENSIONS = {
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif",
+    "webp", "bmp", "mp4", "mov", "avi", "mkv", "wmv", "m4v", "3gp",
+}
+
+MIME_MAP = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "gif": "image/gif", "heic": "image/heic", "heif": "image/heif",
+    "tiff": "image/tiff", "tif": "image/tiff", "webp": "image/webp",
+    "bmp": "image/bmp", "mp4": "video/mp4", "mov": "video/quicktime",
+    "avi": "video/x-msvideo", "mkv": "video/x-matroska",
+    "wmv": "video/x-ms-wmv", "m4v": "video/x-m4v", "3gp": "video/3gpp",
+}
+
+# Thread-local HTTP connection pool
+_local = threading.local()
+
+# Module-level logger (configured by setup_logging)
+logger = logging.getLogger("immich_import")
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+def setup_logging():
+    """Configure logging to stdout and logs/import.log (cleared on each start)."""
+    logs_dir = SCRIPT_DIR / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    ops_log = logs_dir / "import.log"
+    # Clear operational log on each start (CLAUDE.md compliance)
+    ops_log.write_text("")
+
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("[%(levelname)s] %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.setFormatter(fmt)
+
+    file_handler = logging.FileHandler(str(ops_log))
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(file_handler)
+
+    logger.debug("Logging initialised. Operational log: %s", ops_log)
+
+
+def log_checkpoint(message: str):
+    """Append a line to the persistent import.log checkpoint file."""
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{ts} {message}\n")
+
+
+# ---------------------------------------------------------------------------
+# Prerequisites
+# ---------------------------------------------------------------------------
+def check_prerequisites():
+    logger.info("Checking prerequisites...")
+    api_key = os.environ.get("IMMICH_API_KEY", "")
+    if not api_key:
+        logger.error(
+            "IMMICH_API_KEY not set. Get one from: %s → Account Settings → API Keys",
+            IMMICH_URL,
+        )
+        sys.exit(1)
+    if not os.path.isdir(PHOTOS_DIR):
+        logger.error("Photos directory not found: '%s'. Is the NAS mounted?", PHOTOS_DIR)
+        sys.exit(1)
+    logger.info("Prerequisites satisfied.")
+
+
+def check_immich_reachable():
+    """Ping Immich and validate the API key. Retries up to 12×5s."""
+    logger.info("Checking Immich...")
+    attempts = 12
+    delay = 5
+    for i in range(1, attempts + 1):
+        try:
+            req = Request(f"{IMMICH_URL}/api/server/ping", method="GET")
+            with urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    break
+                code = resp.status
+        except Exception:
+            code = 0
+        if i == attempts:
+            logger.error(
+                "Cannot reach Immich at %s after %ds. Run ./start.sh first.",
+                IMMICH_URL, attempts * delay,
+            )
+            sys.exit(1)
+        logger.info("Immich not ready yet (HTTP %s), retrying in %ds... (%d/%d)", code, delay, i, attempts)
+        time.sleep(delay)
+
+    # Validate API key
+    try:
+        req = Request(
+            f"{IMMICH_URL}/api/users/me",
+            headers={"x-api-key": os.environ.get("IMMICH_API_KEY", "")},
+        )
+        with urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+    except Exception:
+        logger.error("API key invalid or expired. Generate a new one in the Immich web UI.")
+        sys.exit(1)
+
+    logger.info("Immich reachable. API key valid.")
+
+
+def check_nas_reachable():
+    if not os.path.isdir(PHOTOS_DIR):
+        logger.error("NAS no longer reachable at '%s'. Check the mount and re-run.", PHOTOS_DIR)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+def load_checkpoint() -> set:
+    """Parse import.log and return a set of relative paths already processed."""
+    done = set()
+    if not os.path.isfile(LOG_FILE):
+        return done
+    pattern = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (CREATED|DUPLICATE)\s+(.+)$")
+    with open(LOG_FILE) as f:
+        for line in f:
+            m = pattern.match(line.rstrip("\n"))
+            if m:
+                done.add(m.group(2))
+    if done:
+        logger.info("Checkpoint: %d already processed — will skip.", len(done))
+    return done
+
+
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+def find_media_files():
+    """Generator yielding absolute paths to media files under PHOTOS_DIR.
+    Skips files >= LARGE_FILE_MB in size."""
+    large_bytes = LARGE_FILE_MB * 1024 * 1024
+    for root, _dirs, files in os.walk(PHOTOS_DIR):
+        for fname in files:
+            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            if ext not in MEDIA_EXTENSIONS:
+                continue
+            full = os.path.join(root, fname)
+            try:
+                if os.path.getsize(full) >= large_bytes:
+                    logger.warning("Skipping large file (>%dMB): %s", LARGE_FILE_MB, full)
+                    continue
+            except OSError:
+                continue
+            yield full
+
+
+# ---------------------------------------------------------------------------
+# SHA1 + bulk-upload-check (prechecker)
+# ---------------------------------------------------------------------------
+def sha1_b64(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return base64.b64encode(h.digest()).decode()
+
+
+def bulk_upload_check(batch: list) -> set:
+    """POST /api/assets/bulk-upload-check for a batch of (abs_path, rel_path) pairs.
+    Returns a set of relative paths that Immich already has (action==reject)."""
+    assets = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(sha1_b64, p): (p, rel) for p, rel in batch}
+        for fut in as_completed(futs):
+            p, rel = futs[fut]
+            try:
+                assets.append({"id": rel, "checksum": fut.result()})
+            except Exception as e:
+                logger.warning("sha1 failed for %s: %s", p, e)
+
+    payload = json.dumps({"assets": assets}).encode()
+    req = Request(
+        f"{IMMICH_URL}/api/assets/bulk-upload-check",
+        data=payload,
+        headers={
+            "x-api-key": os.environ.get("IMMICH_API_KEY", ""),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=30) as resp:
+        results = json.loads(resp.read())["results"]
+    return {r["id"] for r in results if r.get("action") == "reject"}
+
+
+def prechecker(paths_iter, precheck_dupes_list: list):
+    """Generator: batches paths, hashes, checks against Immich, yields only new ones.
+    Appends already-seen relative paths to precheck_dupes_list."""
+    prefix = PHOTOS_DIR.rstrip("/") + "/"
+    batch = []
+
+    def flush(b):
+        try:
+            dupes = bulk_upload_check(b)
+        except Exception as e:
+            logger.warning("bulk-upload-check failed (%s), uploading batch anyway", e)
+            dupes = set()
+        for p, rel in b:
+            if rel in dupes:
+                precheck_dupes_list.append(rel)
+            else:
+                yield p
+
+    # Need to use a helper since we can't yield inside a nested function
+    def _flush_batch(b):
+        try:
+            dupes = bulk_upload_check(b)
+        except Exception as e:
+            logger.warning("bulk-upload-check failed (%s), uploading batch anyway", e)
+            dupes = set()
+        results = []
+        for p, rel in b:
+            if rel in dupes:
+                precheck_dupes_list.append(rel)
+            else:
+                results.append(p)
+        return results
+
+    for path in paths_iter:
+        rel = path[len(prefix):] if path.startswith(prefix) else path
+        batch.append((path, rel))
+        if len(batch) >= BATCH_SIZE:
+            yield from _flush_batch(batch)
+            batch = []
+    if batch:
+        yield from _flush_batch(batch)
+
+
+# ---------------------------------------------------------------------------
+# Upload helpers
+# ---------------------------------------------------------------------------
+def get_mime_type(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return MIME_MAP.get(ext, "application/octet-stream")
+
+
+def get_taken_at(path: str) -> str:
+    """Return ISO timestamp: from JSON sidecar photoTakenTime, or file mtime."""
+    json_file = path + ".json"
+    if os.path.isfile(json_file):
+        try:
+            with open(json_file) as f:
+                d = json.load(f)
+            ts = int(d.get("photoTakenTime", d.get("creationTime", {})).get("timestamp", 0))
+            if ts:
+                return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        except Exception:
+            pass
+    mtime = os.stat(path).st_mtime
+    return datetime.datetime.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def build_multipart(fields: dict, file_path: str, mime: str) -> bytes:
+    boundary = b"----immichboundary"
+    body = b""
+    for name, val in fields.items():
+        body += b"--" + boundary + b"\r\n"
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode()
+    fname = os.path.basename(file_path)
+    body += b"--" + boundary + b"\r\n"
+    body += (
+        f'Content-Disposition: form-data; name="assetData"; filename="{fname}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode()
+    with open(file_path, "rb") as fh:
+        body += fh.read()
+    body += b"\r\n--" + boundary + b"--\r\n"
+    return body
+
+
+def get_conn() -> HTTPConnection:
+    """Return a thread-local persistent HTTPConnection, creating one if needed."""
+    parsed = urlparse(IMMICH_URL)
+    host = parsed.hostname
+    port = parsed.port or 80
+    if not getattr(_local, "conn", None):
+        _local.conn = HTTPConnection(host, port, timeout=60)
+    return _local.conn
+
+
+def upload(file_path: str) -> tuple:
+    """Upload one file. Returns (status_str, relative_path)."""
+    prefix = PHOTOS_DIR.rstrip("/") + "/"
+    rel = file_path[len(prefix):] if file_path.startswith(prefix) else file_path
+    mime = get_mime_type(file_path)
+    try:
+        taken_at = get_taken_at(file_path)
+    except Exception:
+        taken_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    fields = {
+        "deviceAssetId": rel,
+        "deviceId": "import-script",
+        "fileCreatedAt": taken_at,
+        "fileModifiedAt": taken_at,
+        "isFavorite": "false",
+    }
+    try:
+        body = build_multipart(fields, file_path, mime)
+    except Exception as e:
+        logger.warning("read failed %s: %s", rel, e)
+        return ("failed:read error", rel)
+
+    ctype = "multipart/form-data; boundary=----immichboundary"
+    api_key = os.environ.get("IMMICH_API_KEY", "")
+    for attempt in range(3):
+        try:
+            conn = get_conn()
+            conn.request(
+                "POST", "/api/assets", body=body,
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": ctype,
+                    "Accept": "application/json",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            resp = conn.getresponse()
+            code = resp.status
+            rbody = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception:
+            _local.conn = None
+            if attempt == 2:
+                logger.warning("%s — connection failed after 3 attempts", rel)
+                return ("failed:HTTP 000", rel)
+
+    if code in (200, 201):
+        try:
+            status = json.loads(rbody).get("status", "created")
+        except Exception:
+            status = "created"
+    else:
+        logger.warning("%s — HTTP %d: %s", rel, code, rbody)
+        status = f"failed:HTTP {code}"
+    return (status, rel)
+
+
+# ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
+def format_duration(secs: int) -> str:
+    return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+
+
+def print_progress(processed, created, dupes, failed, start_time):
+    elapsed = int(time.time()) - start_time
+    rate = (processed * 60) // elapsed if elapsed > 0 else 0
+    logger.info(
+        "[PROGRESS] %d processed | %d imported | %d dupes | %d failed | %d files/min | elapsed: %s",
+        processed, created, dupes, failed, rate, format_duration(elapsed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main import runner
+# ---------------------------------------------------------------------------
+def run_import(mode: str) -> bool:
+    """Orchestrate the import. Returns True if no failures."""
+    created = dupes = failed = processed = 0
+    start_time = int(time.time())
+
+    checkpoint = load_checkpoint()
+    skipped = len(checkpoint)
+
+    prefix = PHOTOS_DIR.rstrip("/") + "/"
+
+    log_checkpoint(f"=== Import started (mode={mode}, parallel={MAX_PARALLEL}) ===")
+
+    if mode == "test":
+        logger.info("Test mode: uploading first %d files...", TEST_COUNT)
+    else:
+        logger.info(
+            "Full import | %d parallel uploads | skipping files >%dMB | prechecker enabled | progress every %d files",
+            MAX_PARALLEL, LARGE_FILE_MB, PROGRESS_INTERVAL,
+        )
+
+    precheck_dupes_list = []
+
+    # Build file source
+    all_files = find_media_files()
+
+    if mode == "test":
+        # Skip checkpoint filter and prechecker; take first TEST_COUNT files
+        import itertools
+        source = itertools.islice(all_files, TEST_COUNT)
+    else:
+        # Filter checkpoint, then prechecker
+        def filtered():
+            for p in all_files:
+                rel = p[len(prefix):] if p.startswith(prefix) else p
+                if rel not in checkpoint:
+                    yield p
+
+        source = prechecker(filtered(), precheck_dupes_list)
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        futures = []
+        for path in source:
+            futures.append(pool.submit(upload, path))
+
+        for fut in as_completed(futures):
+            status, rel = fut.result()
+            processed += 1
+
+            if status == "created":
+                created += 1
+                logger.info("[OK]    (%d) %s", processed, rel)
+                log_checkpoint(f"CREATED   {rel}")
+            elif status == "duplicate":
+                dupes += 1
+                logger.info("[SKIP]  (%d) %s", processed, rel)
+                log_checkpoint(f"DUPLICATE {rel}")
+            else:
+                failed += 1
+                detail = status[len("failed:"):] if status.startswith("failed:") else status
+                logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
+                log_checkpoint(f"FAILED    {rel} — {detail}")
+
+            if processed % PROGRESS_INTERVAL == 0:
+                check_nas_reachable()
+                print_progress(processed, created, dupes, failed, start_time)
+
+    # Count prechecker duplicates
+    precheck_dupe_count = len(precheck_dupes_list)
+    for rel in precheck_dupes_list:
+        logger.info("[SKIP]  (precheck) %s", rel)
+        log_checkpoint(f"DUPLICATE {rel}")
+    dupes += precheck_dupe_count
+    if precheck_dupe_count:
+        logger.info("Prechecker skipped %d already-uploaded files.", precheck_dupe_count)
+
+    elapsed = int(time.time()) - start_time
+
+    logger.info("")
+    logger.info("=== Import complete ===")
+    logger.info("  Imported  : %d", created)
+    logger.info("  Duplicates: %d (%d caught before upload by prechecker)", dupes, precheck_dupe_count)
+    logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
+    logger.info("  Failed    : %d", failed)
+    logger.info("  Processed : %d", processed)
+    logger.info("  Elapsed   : %s", format_duration(elapsed))
+    logger.info("  Log       : %s", LOG_FILE)
+
+    log_checkpoint(
+        f"=== Import finished: created={created} duplicate={dupes} "
+        f"skipped={skipped} failed={failed} precheck_skipped={precheck_dupe_count} "
+        f"elapsed={elapsed}s ==="
+    )
+
+    return failed == 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def usage():
+    print(f"Usage: IMMICH_API_KEY=<key> python3 {sys.argv[0]} [--test|--all]")
+    print("")
+    print(f"  --test   Upload {TEST_COUNT} sample files (default)")
+    print("  --all    Upload all photos and videos")
+    print("")
+    print(f"  IMMICH_PARALLEL={MAX_PARALLEL}  set number of concurrent uploads (default: 14)")
+    sys.exit(1)
+
+
+def main():
+    setup_logging()
+
+    args = sys.argv[1:]
+    if not args or args[0] == "--test":
+        mode = "test"
+    elif args[0] == "--all":
+        mode = "all"
+    else:
+        logger.error("Unknown flag: %s", args[0])
+        usage()
+
+    logger.info("=== Immich Importer ===")
+    check_prerequisites()
+    check_immich_reachable()
+    success = run_import(mode)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
