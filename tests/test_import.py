@@ -77,6 +77,18 @@ class TestPrerequisites(unittest.TestCase):
                             m.main()
         self.assertEqual(ctx.exception.code, 1)
 
+    def test_withvideo_flag_recognized(self):
+        """--all --withvideo is a valid combination — no 'Unknown flag' error."""
+        with patch.object(sys, "argv", ["import.py", "--all", "--withvideo"]):
+            with patch.object(m, "setup_logging"):
+                with patch.object(m, "check_prerequisites"):
+                    with patch.object(m, "check_immich_reachable"):
+                        with patch.object(m, "run_import", return_value=True):
+                            try:
+                                m.main()
+                            except SystemExit as e:
+                                self.assertEqual(e.code, 0)
+
 
 # ---------------------------------------------------------------------------
 # 2. Checkpoint
@@ -128,6 +140,14 @@ class TestCheckpoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestFindMediaFiles(unittest.TestCase):
 
+    def _find(self, photos_dir, extensions=None, large_mb=99):
+        """Helper: run find_media_files with patched PHOTOS_DIR and LARGE_FILE_MB."""
+        with patch.object(m, "PHOTOS_DIR", photos_dir):
+            with patch.object(m, "LARGE_FILE_MB", large_mb):
+                if extensions is not None:
+                    return list(m.find_media_files(extensions))
+                return list(m.find_media_files())
+
     def test_find_media_files_filters_by_extension(self):
         """Only media extensions are yielded; .txt is excluded."""
         with tempfile.TemporaryDirectory() as td:
@@ -135,11 +155,31 @@ class TestFindMediaFiles(unittest.TestCase):
             txt = os.path.join(td, "notes.txt")
             open(jpg, "w").close()
             open(txt, "w").close()
-            with patch.object(m, "PHOTOS_DIR", td):
-                with patch.object(m, "LARGE_FILE_MB", 99):
-                    results = list(m.find_media_files())
+            results = self._find(td)
         self.assertIn(jpg, results)
         self.assertNotIn(txt, results)
+
+    def test_find_media_files_photos_only(self):
+        """Passing PHOTO_EXTENSIONS → jpg returned, mp4 not."""
+        with tempfile.TemporaryDirectory() as td:
+            jpg = os.path.join(td, "photo.jpg")
+            mp4 = os.path.join(td, "clip.mp4")
+            open(jpg, "w").close()
+            open(mp4, "w").close()
+            results = self._find(td, extensions=m.PHOTO_EXTENSIONS)
+        self.assertIn(jpg, results)
+        self.assertNotIn(mp4, results)
+
+    def test_find_media_files_videos_only(self):
+        """Passing VIDEO_EXTENSIONS → mp4 returned, jpg not."""
+        with tempfile.TemporaryDirectory() as td:
+            jpg = os.path.join(td, "photo.jpg")
+            mp4 = os.path.join(td, "clip.mp4")
+            open(jpg, "w").close()
+            open(mp4, "w").close()
+            results = self._find(td, extensions=m.VIDEO_EXTENSIONS)
+        self.assertNotIn(jpg, results)
+        self.assertIn(mp4, results)
 
     def test_find_media_files_skips_large_files(self):
         """Files >= LARGE_FILE_MB are not yielded."""
@@ -147,12 +187,9 @@ class TestFindMediaFiles(unittest.TestCase):
             small = os.path.join(td, "small.jpg")
             large = os.path.join(td, "large.jpg")
             open(small, "w").close()
-            # Write exactly 1 byte over the limit
             with open(large, "wb") as f:
                 f.write(b"\x00" * (2 * 1024 * 1024))  # 2 MB
-            with patch.object(m, "PHOTOS_DIR", td):
-                with patch.object(m, "LARGE_FILE_MB", 1):  # 1 MB limit
-                    results = list(m.find_media_files())
+            results = self._find(td, large_mb=1)
         self.assertIn(small, results)
         self.assertNotIn(large, results)
 

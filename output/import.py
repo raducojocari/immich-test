@@ -2,23 +2,23 @@
 # import.py - Imports Google Photos Takeout archives into Immich.
 #
 # Usage:
-#   IMMICH_API_KEY=<key> python3 output/import.py --test   # Upload 5 sample files
-#   IMMICH_API_KEY=<key> python3 output/import.py --all    # Upload all photos and videos
+#   IMMICH_API_KEY=<key> python3 output/import.py --test              # 5 sample photos
+#   IMMICH_API_KEY=<key> python3 output/import.py --all               # all photos
+#   IMMICH_API_KEY=<key> python3 output/import.py --all --withvideo   # all videos only
+#   IMMICH_API_KEY=<key> python3 output/import.py --test --withvideo  # 5 sample videos
 #
 # The script is safe to re-run — files already in the log are skipped without
 # touching the NAS, so it resumes cleanly after a crash or interruption.
 #
 # Tuning (set as env vars):
-#   IMMICH_PARALLEL=14          concurrent uploads (default: 14)
+#   IMMICH_PARALLEL=10          concurrent photo uploads (default: 10)
+#   IMMICH_VIDEO_PARALLEL=2     concurrent video uploads (default: 2)
 #   IMMICH_TEST_COUNT=5         files for --test mode (default: 5)
 #   IMMICH_LARGE_MB=99          files larger than this are skipped (default: 99)
-#   PRECHECKER_BATCH_SIZE=50    files per bulk-upload-check batch (default: 50)
 
 import os
 import sys
 import json
-import hashlib
-import base64
 import datetime
 import threading
 import time
@@ -26,7 +26,8 @@ import re
 import signal
 import logging
 import pathlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import itertools
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
@@ -40,15 +41,18 @@ PHOTOS_DIR      = os.environ.get("IMMICH_PHOTOS_DIR", "/Volumes/nas/Google Photo
 IMMICH_URL      = os.environ.get("IMMICH_URL", "http://localhost:2283")
 TEST_COUNT      = int(os.environ.get("IMMICH_TEST_COUNT", "5"))
 LOG_FILE        = str(SCRIPT_DIR / "import.log")
-MAX_PARALLEL    = int(os.environ.get("IMMICH_PARALLEL", "14"))
+MAX_PARALLEL    = int(os.environ.get("IMMICH_PARALLEL", "10"))
+VIDEO_PARALLEL  = int(os.environ.get("IMMICH_VIDEO_PARALLEL", "2"))
 LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
-BATCH_SIZE      = int(os.environ.get("PRECHECKER_BATCH_SIZE", "50"))
 PROGRESS_INTERVAL = 50
 
-MEDIA_EXTENSIONS = {
-    "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif",
-    "webp", "bmp", "mp4", "mov", "avi", "mkv", "wmv", "m4v", "3gp",
+PHOTO_EXTENSIONS = {
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif", "webp", "bmp",
 }
+VIDEO_EXTENSIONS = {
+    "mp4", "mov", "avi", "mkv", "wmv", "m4v", "3gp",
+}
+MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS   # retained for MIME_MAP completeness
 
 MIME_MAP = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -186,14 +190,19 @@ def load_checkpoint() -> set:
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
-def find_media_files():
-    """Generator yielding absolute paths to media files under PHOTOS_DIR.
-    Skips files >= LARGE_FILE_MB in size."""
+def find_media_files(extensions=MEDIA_EXTENSIONS):
+    """Generator yielding absolute paths to media files filtered by extensions.
+    Skips files >= LARGE_FILE_MB. Walks PHOTOS_DIR on every call."""
     large_bytes = LARGE_FILE_MB * 1024 * 1024
+    logger.info("Walking NAS: %s", PHOTOS_DIR)
+    dirs_visited = 0
     for root, _dirs, files in os.walk(PHOTOS_DIR):
+        dirs_visited += 1
+        if dirs_visited % 10 == 0:
+            logger.info("Walking... %d dirs scanned so far", dirs_visited)
         for fname in files:
             ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-            if ext not in MEDIA_EXTENSIONS:
+            if ext not in extensions:
                 continue
             full = os.path.join(root, fname)
             try:
@@ -204,88 +213,6 @@ def find_media_files():
                 continue
             yield full
 
-
-# ---------------------------------------------------------------------------
-# SHA1 + bulk-upload-check (prechecker)
-# ---------------------------------------------------------------------------
-def sha1_b64(path: str) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return base64.b64encode(h.digest()).decode()
-
-
-def bulk_upload_check(batch: list) -> set:
-    """POST /api/assets/bulk-upload-check for a batch of (abs_path, rel_path) pairs.
-    Returns a set of relative paths that Immich already has (action==reject)."""
-    assets = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(sha1_b64, p): (p, rel) for p, rel in batch}
-        for fut in as_completed(futs):
-            p, rel = futs[fut]
-            try:
-                assets.append({"id": rel, "checksum": fut.result()})
-            except Exception as e:
-                logger.warning("sha1 failed for %s: %s", p, e)
-
-    payload = json.dumps({"assets": assets}).encode()
-    req = Request(
-        f"{IMMICH_URL}/api/assets/bulk-upload-check",
-        data=payload,
-        headers={
-            "x-api-key": os.environ.get("IMMICH_API_KEY", ""),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    with urlopen(req, timeout=30) as resp:
-        results = json.loads(resp.read())["results"]
-    return {r["id"] for r in results if r.get("action") == "reject"}
-
-
-def prechecker(paths_iter, precheck_dupes_list: list):
-    """Generator: batches paths, hashes, checks against Immich, yields only new ones.
-    Appends already-seen relative paths to precheck_dupes_list."""
-    prefix = PHOTOS_DIR.rstrip("/") + "/"
-    batch = []
-
-    def flush(b):
-        try:
-            dupes = bulk_upload_check(b)
-        except Exception as e:
-            logger.warning("bulk-upload-check failed (%s), uploading batch anyway", e)
-            dupes = set()
-        for p, rel in b:
-            if rel in dupes:
-                precheck_dupes_list.append(rel)
-            else:
-                yield p
-
-    # Need to use a helper since we can't yield inside a nested function
-    def _flush_batch(b):
-        try:
-            dupes = bulk_upload_check(b)
-        except Exception as e:
-            logger.warning("bulk-upload-check failed (%s), uploading batch anyway", e)
-            dupes = set()
-        results = []
-        for p, rel in b:
-            if rel in dupes:
-                precheck_dupes_list.append(rel)
-            else:
-                results.append(p)
-        return results
-
-    for path in paths_iter:
-        rel = path[len(prefix):] if path.startswith(prefix) else path
-        batch.append((path, rel))
-        if len(batch) >= BATCH_SIZE:
-            yield from _flush_batch(batch)
-            batch = []
-    if batch:
-        yield from _flush_batch(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +344,7 @@ def print_progress(processed, created, dupes, failed, start_time):
 # ---------------------------------------------------------------------------
 # Main import runner
 # ---------------------------------------------------------------------------
-def run_import(mode: str) -> bool:
+def run_import(mode: str, with_video: bool = False) -> bool:
     """Orchestrate the import. Returns True if no failures."""
     created = dupes = failed = processed = 0
     start_time = int(time.time())
@@ -427,77 +354,76 @@ def run_import(mode: str) -> bool:
 
     prefix = PHOTOS_DIR.rstrip("/") + "/"
 
-    log_checkpoint(f"=== Import started (mode={mode}, parallel={MAX_PARALLEL}) ===")
+    extensions = VIDEO_EXTENSIONS if with_video else PHOTO_EXTENSIONS
+    media_type = "video" if with_video else "photo"
+    workers = VIDEO_PARALLEL if with_video else MAX_PARALLEL
+
+    log_checkpoint(f"=== Import started (mode={mode}, media={media_type}, parallel={workers}) ===")
 
     if mode == "test":
-        logger.info("Test mode: uploading first %d files...", TEST_COUNT)
+        logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
     else:
         logger.info(
-            "Full import | %d parallel uploads | skipping files >%dMB | prechecker enabled | progress every %d files",
-            MAX_PARALLEL, LARGE_FILE_MB, PROGRESS_INTERVAL,
+            "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
+            media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
         )
 
-    precheck_dupes_list = []
-
     # Build file source
-    all_files = find_media_files()
+    all_files = find_media_files(extensions)
 
     if mode == "test":
-        # Skip checkpoint filter and prechecker; take first TEST_COUNT files
-        import itertools
         source = itertools.islice(all_files, TEST_COUNT)
     else:
-        # Filter checkpoint, then prechecker
         def filtered():
             for p in all_files:
                 rel = p[len(prefix):] if p.startswith(prefix) else p
                 if rel not in checkpoint:
                     yield p
 
-        source = prechecker(filtered(), precheck_dupes_list)
+        source = filtered()
 
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
-        futures = []
-        for path in source:
-            futures.append(pool.submit(upload, path))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        path_iter = iter(source)
+        pending = set()
 
-        for fut in as_completed(futures):
-            status, rel = fut.result()
-            processed += 1
+        for path in itertools.islice(path_iter, workers * 3):
+            pending.add(pool.submit(upload, path))
 
-            if status == "created":
-                created += 1
-                logger.info("[OK]    (%d) %s", processed, rel)
-                log_checkpoint(f"CREATED   {rel}")
-            elif status == "duplicate":
-                dupes += 1
-                logger.info("[SKIP]  (%d) %s", processed, rel)
-                log_checkpoint(f"DUPLICATE {rel}")
-            else:
-                failed += 1
-                detail = status[len("failed:"):] if status.startswith("failed:") else status
-                logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
-                log_checkpoint(f"FAILED    {rel} — {detail}")
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                status, rel = fut.result()
+                processed += 1
 
-            if processed % PROGRESS_INTERVAL == 0:
-                check_nas_reachable()
-                print_progress(processed, created, dupes, failed, start_time)
+                if status == "created":
+                    created += 1
+                    logger.info("[OK]    (%d) %s", processed, rel)
+                    log_checkpoint(f"CREATED   {rel}")
+                elif status == "duplicate":
+                    dupes += 1
+                    logger.info("[SKIP]  (%d) %s", processed, rel)
+                    log_checkpoint(f"DUPLICATE {rel}")
+                else:
+                    failed += 1
+                    detail = status[len("failed:"):] if status.startswith("failed:") else status
+                    logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
+                    log_checkpoint(f"FAILED    {rel} — {detail}")
 
-    # Count prechecker duplicates
-    precheck_dupe_count = len(precheck_dupes_list)
-    for rel in precheck_dupes_list:
-        logger.info("[SKIP]  (precheck) %s", rel)
-        log_checkpoint(f"DUPLICATE {rel}")
-    dupes += precheck_dupe_count
-    if precheck_dupe_count:
-        logger.info("Prechecker skipped %d already-uploaded files.", precheck_dupe_count)
+                if processed % PROGRESS_INTERVAL == 0:
+                    check_nas_reachable()
+                    print_progress(processed, created, dupes, failed, start_time)
+
+                try:
+                    pending.add(pool.submit(upload, next(path_iter)))
+                except StopIteration:
+                    pass
 
     elapsed = int(time.time()) - start_time
 
     logger.info("")
     logger.info("=== Import complete ===")
     logger.info("  Imported  : %d", created)
-    logger.info("  Duplicates: %d (%d caught before upload by prechecker)", dupes, precheck_dupe_count)
+    logger.info("  Duplicates: %d", dupes)
     logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
     logger.info("  Failed    : %d", failed)
     logger.info("  Processed : %d", processed)
@@ -506,8 +432,7 @@ def run_import(mode: str) -> bool:
 
     log_checkpoint(
         f"=== Import finished: created={created} duplicate={dupes} "
-        f"skipped={skipped} failed={failed} precheck_skipped={precheck_dupe_count} "
-        f"elapsed={elapsed}s ==="
+        f"skipped={skipped} failed={failed} elapsed={elapsed}s ==="
     )
 
     return failed == 0
@@ -517,31 +442,33 @@ def run_import(mode: str) -> bool:
 # Entry point
 # ---------------------------------------------------------------------------
 def usage():
-    print(f"Usage: IMMICH_API_KEY=<key> python3 {sys.argv[0]} [--test|--all]")
+    print(f"Usage: IMMICH_API_KEY=<key> python3 {sys.argv[0]} [--test|--all] [--withvideo]")
     print("")
-    print(f"  --test   Upload {TEST_COUNT} sample files (default)")
-    print("  --all    Upload all photos and videos")
+    print(f"  --test                Upload {TEST_COUNT} sample photos (default)")
+    print("  --all                 Upload all photos")
+    print("  --all --withvideo     Upload all videos only")
+    print("  --test --withvideo    Upload first 5 sample videos")
     print("")
-    print(f"  IMMICH_PARALLEL={MAX_PARALLEL}  set number of concurrent uploads (default: 14)")
+    print(f"  IMMICH_PARALLEL={MAX_PARALLEL}          concurrent photo uploads (default: 10)")
+    print(f"  IMMICH_VIDEO_PARALLEL={VIDEO_PARALLEL}    concurrent video uploads (default: 2)")
     sys.exit(1)
 
 
 def main():
     setup_logging()
 
-    args = sys.argv[1:]
-    if not args or args[0] == "--test":
-        mode = "test"
-    elif args[0] == "--all":
-        mode = "all"
-    else:
-        logger.error("Unknown flag: %s", args[0])
+    args = set(sys.argv[1:])
+    unknown = args - {"--test", "--all", "--withvideo"}
+    if unknown:
+        logger.error("Unknown flag: %s", next(iter(unknown)))
         usage()
+    mode = "all" if "--all" in args else "test"
+    with_video = "--withvideo" in args
 
     logger.info("=== Immich Importer ===")
     check_prerequisites()
     check_immich_reachable()
-    success = run_import(mode)
+    success = run_import(mode, with_video)
     sys.exit(0 if success else 1)
 
 
