@@ -30,7 +30,7 @@ import logging
 import pathlib
 import itertools
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, ALL_COMPLETED
 from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
@@ -50,7 +50,7 @@ LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
 PROGRESS_INTERVAL = 50
 NAS_MOUNT_POINT = os.environ.get("NAS_MOUNT_POINT", "/Volumes/nas")
 NAS_REMOTE      = os.environ.get("NAS_REMOTE", "")   # e.g. "192.168.1.100:/volume1/photos"
-REMOUNT_COOLDOWN = 60  # seconds between remounts
+DOCKER_COMPOSE_FILE = os.path.join(SCRIPT_DIR, "install", "docker-compose.yml")
 
 PHOTO_EXTENSIONS = {
     "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif", "webp", "bmp",
@@ -73,11 +73,29 @@ MIME_MAP = {
 _local = threading.local()
 
 # NAS remount state
-_remount_lock = threading.Lock()
-_last_remount = 0.0
 _http000_count = 0
 _http000_lock = threading.Lock()
 HTTP000_REMOUNT_THRESHOLD = 10
+
+# Recovery event — set by upload() when threshold is hit; cleared by run_import() on each loop
+_recovery_event = threading.Event()
+
+
+def _maybe_trigger_recovery():
+    """Increment the shared failure counter; trigger recovery if threshold reached."""
+    global _http000_count
+    with _http000_lock:
+        _http000_count += 1
+        count = _http000_count
+        if count >= HTTP000_REMOUNT_THRESHOLD:
+            _http000_count = 0
+    if count >= HTTP000_REMOUNT_THRESHOLD:
+        logger.warning(
+            "Failure threshold reached (%d) — triggering full recovery",
+            HTTP000_REMOUNT_THRESHOLD,
+        )
+        _recovery_event.set()
+
 
 # Module-level logger (configured by setup_logging)
 logger = logging.getLogger("immich_import")
@@ -177,38 +195,69 @@ def check_immich_reachable():
 
 def check_nas_reachable():
     if not os.path.isdir(PHOTOS_DIR):
-        logger.error("NAS no longer reachable at '%s'. Check the mount and re-run.", PHOTOS_DIR)
-        sys.exit(1)
+        logger.error(
+            "NAS no longer reachable at '%s' — triggering full recovery", PHOTOS_DIR
+        )
+        _recovery_event.set()
 
 
-def remount_nas():
-    """Unmount and remount the NAS. Thread-safe with cooldown to avoid storm."""
-    global _last_remount
-    with _remount_lock:
-        now = time.time()
-        if now - _last_remount < REMOUNT_COOLDOWN:
-            logger.info("Remount skipped — cooldown active (%ds since last remount)", int(now - _last_remount))
-            return
-        if not NAS_REMOTE:
-            logger.warning("HTTP 000 detected but NAS_REMOTE not set — skipping remount. "
-                           "Set NAS_REMOTE=<host>:<export> to enable auto-recovery.")
-            return
-        logger.warning("HTTP 000 detected — remounting NAS: %s -> %s", NAS_REMOTE, NAS_MOUNT_POINT)
-        try:
-            subprocess.run(["sudo", "umount", "-f", NAS_MOUNT_POINT],
-                           check=False, timeout=30, capture_output=True)
-            time.sleep(2)
+def full_recovery():
+    """Stop uploads, remount NAS, restart Docker, wait for Immich. Called from main loop."""
+    logger.warning("=== FULL RECOVERY START: remounting NAS + restarting Docker ===")
+
+    # 1. Remount NAS
+    mount_script = os.path.join(SCRIPT_DIR, "mount.sh")
+    nas_mounted = os.path.ismount(NAS_MOUNT_POINT)
+    if not nas_mounted:
+        if os.path.isfile(mount_script):
+            logger.warning("NAS not mounted — running sudo mount.sh: %s", mount_script)
             result = subprocess.run(
-                ["sudo", "mount", "-t", "nfs", NAS_REMOTE, NAS_MOUNT_POINT],
-                check=False, timeout=30, capture_output=True, text=True,
+                ["sudo", mount_script],
+                check=False, timeout=60, capture_output=True, text=True, stdin=subprocess.DEVNULL,
             )
             if result.returncode == 0:
-                _last_remount = time.time()
+                logger.info("NAS remounted via mount.sh: %s", result.stdout.strip())
+            else:
+                logger.error("mount.sh failed (rc=%d): %s", result.returncode,
+                             result.stderr.strip())
+        elif NAS_REMOTE:
+            logger.warning("Unmounting NAS: %s", NAS_MOUNT_POINT)
+            subprocess.run(["sudo", "umount", "-f", NAS_MOUNT_POINT],
+                           check=False, timeout=30, capture_output=True, stdin=subprocess.DEVNULL)
+            time.sleep(2)
+            subprocess.run(["sudo", "mkdir", "-p", NAS_MOUNT_POINT],
+                           check=False, timeout=10, stdin=subprocess.DEVNULL)
+            result = subprocess.run(
+                ["sudo", "mount_nfs", "-o", "resvport", NAS_REMOTE, NAS_MOUNT_POINT],
+                check=False, timeout=30, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
                 logger.info("NAS remounted successfully.")
             else:
-                logger.error("NAS remount failed (rc=%d): %s", result.returncode, result.stderr.strip())
-        except Exception as e:
-            logger.error("NAS remount exception: %s", e)
+                logger.error("NAS remount failed (rc=%d): %s", result.returncode,
+                             result.stderr.strip())
+        else:
+            logger.warning("NAS not mounted, mount.sh not found, and NAS_REMOTE not set "
+                           "— Docker restart will likely fail")
+    else:
+        logger.info("NAS still mounted at %s — skipping remount", NAS_MOUNT_POINT)
+
+    # 2. Restart Docker containers
+    logger.warning("Restarting Docker containers: %s", DOCKER_COMPOSE_FILE)
+    result = subprocess.run(
+        ["docker", "compose", "-f", DOCKER_COMPOSE_FILE, "restart"],
+        check=False, timeout=120, capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        logger.info("Docker containers restarted.")
+    else:
+        logger.error("Docker restart failed (rc=%d): %s", result.returncode, result.stderr.strip())
+
+    # 3. Wait for Immich to be healthy
+    logger.info("Waiting for Immich to become healthy...")
+    check_immich_reachable()  # retries 12×5s with logging
+
+    logger.warning("=== FULL RECOVERY COMPLETE — resuming import ===")
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +363,9 @@ def upload(file_path: str) -> tuple:
     """Upload one file. Returns (status_str, relative_path)."""
     prefix = PHOTOS_DIR.rstrip("/") + "/"
     rel = file_path[len(prefix):] if file_path.startswith(prefix) else file_path
+
+    if _recovery_event.is_set():
+        return ("skipped:recovery", rel)
     mime = get_mime_type(file_path)
     try:
         taken_at = get_taken_at(file_path)
@@ -331,6 +383,7 @@ def upload(file_path: str) -> tuple:
         body = build_multipart(fields, file_path, mime)
     except Exception as e:
         logger.warning("read failed %s: %s", rel, e)
+        _maybe_trigger_recovery()
         return ("failed:read error", rel)
 
     ctype = "multipart/form-data; boundary=----immichboundary"
@@ -354,15 +407,7 @@ def upload(file_path: str) -> tuple:
         except Exception:
             _local.conn = None
             if attempt == 2:
-                global _http000_count
-                with _http000_lock:
-                    _http000_count += 1
-                    count = _http000_count
-                    if count >= HTTP000_REMOUNT_THRESHOLD:
-                        _http000_count = 0
-                if count >= HTTP000_REMOUNT_THRESHOLD:
-                    logger.warning("HTTP 000 threshold reached (%d) — triggering NAS remount", HTTP000_REMOUNT_THRESHOLD)
-                    remount_nas()
+                _maybe_trigger_recovery()
                 logger.warning("%s — connection failed after 3 attempts", rel)
                 return ("failed:HTTP 000", rel)
 
@@ -373,6 +418,8 @@ def upload(file_path: str) -> tuple:
             status = "created"
     else:
         logger.warning("%s — HTTP %d: %s", rel, code, rbody)
+        if code == 500 and "Failed to upload asset" in rbody:
+            _maybe_trigger_recovery()
         status = f"failed:HTTP {code}"
     return (status, rel)
 
@@ -397,97 +444,127 @@ def print_progress(processed, created, dupes, failed, start_time):
 # Main import runner
 # ---------------------------------------------------------------------------
 def run_import(mode: str, with_video: bool = False) -> bool:
-    """Orchestrate the import. Returns True if no failures."""
-    created = dupes = failed = processed = 0
-    start_time = int(time.time())
-
-    checkpoint = load_checkpoint()
-    skipped = len(checkpoint)
-
-    prefix = PHOTOS_DIR.rstrip("/") + "/"
+    """Orchestrate the import. Returns True if no failures. Loops on recovery."""
+    global _http000_count
 
     extensions = VIDEO_EXTENSIONS if with_video else PHOTO_EXTENSIONS
     media_type = "video" if with_video else "photo"
     workers = VIDEO_PARALLEL if with_video else MAX_PARALLEL
+    prefix = PHOTOS_DIR.rstrip("/") + "/"
+    start_time = int(time.time())
 
     log_checkpoint(f"=== Import started (mode={mode}, media={media_type}, parallel={workers}) ===")
 
-    if mode == "test":
-        logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
-    else:
-        logger.info(
-            "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
-            media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
-        )
+    total_created = total_dupes = total_failed = total_processed = 0
 
-    # Build file source
-    all_files = find_media_files(extensions)
+    while True:
+        _recovery_event.clear()
+        with _http000_lock:
+            _http000_count = 0
 
-    if mode == "test":
-        source = itertools.islice(all_files, TEST_COUNT)
-    else:
-        def filtered():
-            for p in all_files:
-                rel = p[len(prefix):] if p.startswith(prefix) else p
-                if rel not in checkpoint:
-                    yield p
+        checkpoint = load_checkpoint()
+        skipped = len(checkpoint)
 
-        source = filtered()
+        created = dupes = failed = processed = 0
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        path_iter = iter(source)
-        pending = set()
+        if mode == "test":
+            logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
+        else:
+            logger.info(
+                "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
+                media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
+            )
 
-        for path in itertools.islice(path_iter, workers * 3):
-            pending.add(pool.submit(upload, path))
+        # Build file source
+        all_files = find_media_files(extensions)
 
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for fut in done:
-                status, rel = fut.result()
-                processed += 1
+        if mode == "test":
+            source = itertools.islice(all_files, TEST_COUNT)
+        else:
+            def filtered():
+                for p in all_files:
+                    rel = p[len(prefix):] if p.startswith(prefix) else p
+                    if rel not in checkpoint:
+                        yield p
 
-                if status == "created":
-                    created += 1
-                    logger.info("[OK]    (%d) %s", processed, rel)
-                    log_checkpoint(f"CREATED   {rel}")
-                elif status == "duplicate":
-                    dupes += 1
-                    logger.info("[SKIP]  (%d) %s", processed, rel)
-                    log_checkpoint(f"DUPLICATE {rel}")
-                else:
-                    failed += 1
-                    detail = status[len("failed:"):] if status.startswith("failed:") else status
-                    logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
-                    log_checkpoint(f"FAILED    {rel} — {detail}")
+            source = filtered()
 
-                if processed % PROGRESS_INTERVAL == 0:
-                    check_nas_reachable()
-                    print_progress(processed, created, dupes, failed, start_time)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            path_iter = iter(source)
+            pending = set()
+
+            for path in itertools.islice(path_iter, workers * 3):
+                pending.add(pool.submit(upload, path))
+
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    status, rel = fut.result()
+                    if status == "skipped:recovery":
+                        continue   # don't count, don't checkpoint
+
+                    processed += 1
+
+                    if status == "created":
+                        created += 1
+                        logger.info("[OK]    (%d) %s", processed, rel)
+                        log_checkpoint(f"CREATED   {rel}")
+                    elif status == "duplicate":
+                        dupes += 1
+                        logger.info("[SKIP]  (%d) %s", processed, rel)
+                        log_checkpoint(f"DUPLICATE {rel}")
+                    else:
+                        failed += 1
+                        detail = status[len("failed:"):] if status.startswith("failed:") else status
+                        logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
+                        log_checkpoint(f"FAILED    {rel} — {detail}")
+
+                    if processed % PROGRESS_INTERVAL == 0:
+                        check_nas_reachable()
+                        print_progress(processed, created, dupes, failed, start_time)
+
+                if _recovery_event.is_set():
+                    # Drain remaining futures (they'll return skipped:recovery)
+                    for f in pending:
+                        f.cancel()
+                    if pending:
+                        wait(pending, return_when=ALL_COMPLETED)
+                    break   # exit while-pending loop
 
                 try:
                     pending.add(pool.submit(upload, next(path_iter)))
                 except StopIteration:
                     pass
 
-    elapsed = int(time.time()) - start_time
+        total_created += created
+        total_dupes += dupes
+        total_failed += failed
+        total_processed += processed
 
-    logger.info("")
-    logger.info("=== Import complete ===")
-    logger.info("  Imported  : %d", created)
-    logger.info("  Duplicates: %d", dupes)
-    logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
-    logger.info("  Failed    : %d", failed)
-    logger.info("  Processed : %d", processed)
-    logger.info("  Elapsed   : %s", format_duration(elapsed))
-    logger.info("  Log       : %s", LOG_FILE)
+        if _recovery_event.is_set():
+            full_recovery()
+            logger.info("Resuming import from checkpoint...")
+            continue   # loop back: reload checkpoint, restart thread pool
 
-    log_checkpoint(
-        f"=== Import finished: created={created} duplicate={dupes} "
-        f"skipped={skipped} failed={failed} elapsed={elapsed}s ==="
-    )
+        # Normal completion
+        elapsed = int(time.time()) - start_time
 
-    return failed == 0
+        logger.info("")
+        logger.info("=== Import complete ===")
+        logger.info("  Imported  : %d", total_created)
+        logger.info("  Duplicates: %d", total_dupes)
+        logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
+        logger.info("  Failed    : %d", total_failed)
+        logger.info("  Processed : %d", total_processed)
+        logger.info("  Elapsed   : %s", format_duration(elapsed))
+        logger.info("  Log       : %s", LOG_FILE)
+
+        log_checkpoint(
+            f"=== Import finished: created={total_created} duplicate={total_dupes} "
+            f"skipped={skipped} failed={total_failed} elapsed={elapsed}s ==="
+        )
+
+        return total_failed == 0
 
 
 # ---------------------------------------------------------------------------

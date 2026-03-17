@@ -440,5 +440,277 @@ class TestLogging(unittest.TestCase):
 import pathlib  # needed for TestLogging
 
 
+# ---------------------------------------------------------------------------
+# 7. Recovery loop
+# ---------------------------------------------------------------------------
+class TestRecoveryLoop(unittest.TestCase):
+
+    def _make_photos_dir(self, td, count=3):
+        """Create `count` fake jpg files and return the photos dir path."""
+        photos_dir = os.path.join(td, "photos")
+        os.makedirs(photos_dir)
+        for i in range(count):
+            with open(os.path.join(photos_dir, f"photo{i}.jpg"), "wb") as f:
+                f.write(b"\x00" * 10)
+        return photos_dir
+
+    def test_recovery_event_causes_skip(self):
+        """upload() returns ('skipped:recovery', rel) when _recovery_event is set."""
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "photo.jpg")
+            with open(img, "wb") as f:
+                f.write(b"\x00" * 10)
+            m._recovery_event.set()
+            try:
+                with patch.object(m, "PHOTOS_DIR", td):
+                    status, rel = m.upload(img)
+            finally:
+                m._recovery_event.clear()
+        self.assertEqual(status, "skipped:recovery")
+
+    def test_http000_threshold_sets_recovery_event(self):
+        """When 10 consecutive connection failures occur, _recovery_event is set."""
+        m._recovery_event.clear()
+        with m._http000_lock:
+            m._http000_count = 0
+
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "photo.jpg")
+            with open(img, "wb") as f:
+                f.write(b"\x00" * 10)
+
+            mock_conn = MagicMock()
+            mock_conn.request.side_effect = ConnectionError("forced failure")
+
+            with patch.object(m, "get_conn", return_value=mock_conn):
+                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
+                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
+                        with patch.object(m, "PHOTOS_DIR", td):
+                            # Drive count to threshold - 1 via the lock directly
+                            with m._http000_lock:
+                                m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
+                            status, _ = m.upload(img)
+
+        try:
+            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set at threshold")
+            self.assertEqual(status, "failed:HTTP 000")
+        finally:
+            m._recovery_event.clear()
+            with m._http000_lock:
+                m._http000_count = 0
+
+    def test_check_nas_reachable_triggers_recovery_when_nas_gone(self):
+        """check_nas_reachable() sets _recovery_event instead of exiting when NAS is gone."""
+        m._recovery_event.clear()
+        with patch.object(m, "PHOTOS_DIR", "/nonexistent/path"):
+            m.check_nas_reachable()   # must NOT raise SystemExit
+        try:
+            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set when NAS is gone")
+        finally:
+            m._recovery_event.clear()
+
+    def test_run_import_loops_after_recovery(self):
+        """run_import triggers full_recovery() and loops when _recovery_event fires."""
+        with tempfile.TemporaryDirectory() as td:
+            photos_dir = self._make_photos_dir(td, count=2)
+            log_file = os.path.join(td, "import.log")
+            script_dir_path = pathlib.Path(td)
+
+            call_counts = {"upload": 0, "recovery": 0}
+
+            def fake_upload(path):
+                call_counts["upload"] += 1
+                if call_counts["upload"] == 1:
+                    # First upload triggers recovery
+                    m._recovery_event.set()
+                    return ("failed:HTTP 000", os.path.basename(path))
+                # Subsequent uploads succeed
+                return ("created", os.path.basename(path))
+
+            def fake_full_recovery():
+                call_counts["recovery"] += 1
+
+            with patch.object(m, "SCRIPT_DIR", script_dir_path):
+                with patch.object(m, "LOG_FILE", log_file):
+                    with patch.object(m, "PHOTOS_DIR", photos_dir):
+                        with patch.object(m, "TEST_COUNT", 2):
+                            with patch.object(m, "check_nas_reachable"):
+                                with patch.object(m, "upload", side_effect=fake_upload):
+                                    with patch.object(m, "full_recovery", side_effect=fake_full_recovery):
+                                        m.logger.handlers.clear()
+                                        m.setup_logging()
+                                        result = m.run_import("test")
+                                        m.logger.handlers.clear()
+
+        self.assertEqual(call_counts["recovery"], 1, "full_recovery should be called once")
+        self.assertGreater(call_counts["upload"], 1, "upload should be called more than once (loop continued)")
+
+    def test_full_recovery_runs_docker_restart(self):
+        """full_recovery() calls docker compose restart and check_immich_reachable."""
+        with patch.object(m, "NAS_REMOTE", ""):
+            with patch.object(m, "check_immich_reachable") as mock_check:
+                with patch("subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0, stderr="")
+                    m.full_recovery()
+
+        mock_check.assert_called_once()
+        # Verify docker compose restart was invoked
+        docker_calls = [
+            c for c in mock_run.call_args_list
+            if c.args[0][:3] == ["docker", "compose", "-f"]
+        ]
+        self.assertEqual(len(docker_calls), 1)
+        self.assertIn("restart", docker_calls[0].args[0])
+
+    def test_read_error_triggers_recovery(self):
+        """A burst of NAS read errors (build_multipart IOError) sets _recovery_event."""
+        m._recovery_event.clear()
+        with m._http000_lock:
+            m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
+
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "photo.jpg")
+            with open(img, "wb") as f:
+                f.write(b"\x00" * 10)
+
+            # Make build_multipart raise IOError (NAS dropped)
+            with patch.object(m, "build_multipart", side_effect=IOError("NAS read error")):
+                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
+                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
+                        with patch.object(m, "PHOTOS_DIR", td):
+                            status, _ = m.upload(img)
+
+        try:
+            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set on read error threshold")
+            self.assertEqual(status, "failed:read error")
+        finally:
+            m._recovery_event.clear()
+            with m._http000_lock:
+                m._http000_count = 0
+
+    def test_http500_storage_failure_triggers_recovery(self):
+        """HTTP 500 'Failed to upload asset' at threshold sets _recovery_event."""
+        m._recovery_event.clear()
+        with m._http000_lock:
+            m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
+
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "photo.jpg")
+            with open(img, "wb") as f:
+                f.write(b"\x00" * 10)
+
+            mock_resp = MagicMock()
+            mock_resp.status = 500
+            mock_resp.read.return_value = (
+                b'{"message":"Failed to upload asset","error":"Internal Server Error","statusCode":500}'
+            )
+            mock_conn = MagicMock()
+            mock_conn.getresponse.return_value = mock_resp
+
+            with patch.object(m, "get_conn", return_value=mock_conn):
+                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
+                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
+                        with patch.object(m, "PHOTOS_DIR", td):
+                            status, _ = m.upload(img)
+
+        try:
+            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set on storage-failure 500 threshold")
+            self.assertEqual(status, "failed:HTTP 500")
+        finally:
+            m._recovery_event.clear()
+            with m._http000_lock:
+                m._http000_count = 0
+
+    def test_http500_other_error_does_not_trigger_recovery(self):
+        """HTTP 500 with non-storage message does NOT count toward recovery threshold."""
+        m._recovery_event.clear()
+        with m._http000_lock:
+            m._http000_count = 0
+
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "photo.jpg")
+            with open(img, "wb") as f:
+                f.write(b"\x00" * 10)
+
+            mock_resp = MagicMock()
+            mock_resp.status = 500
+            mock_resp.read.return_value = b'{"message":"Unsupported file type","statusCode":500}'
+            mock_conn = MagicMock()
+            mock_conn.getresponse.return_value = mock_resp
+
+            with patch.object(m, "get_conn", return_value=mock_conn):
+                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
+                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
+                        with patch.object(m, "PHOTOS_DIR", td):
+                            status, _ = m.upload(img)
+
+        self.assertFalse(m._recovery_event.is_set(), "non-storage 500 should not set recovery event")
+        self.assertEqual(status, "failed:HTTP 500")
+        with m._http000_lock:
+            self.assertEqual(m._http000_count, 0)
+
+    def test_full_recovery_remounts_nas_when_remote_set(self):
+        """full_recovery() falls back to umount + mount_nfs when NAS_REMOTE is set and mount.sh absent."""
+        with tempfile.TemporaryDirectory() as td:
+            # No mount.sh in td → NAS_REMOTE fallback path is exercised
+            with patch.object(m, "NAS_REMOTE", "192.168.1.1:/export"):
+                with patch.object(m, "NAS_MOUNT_POINT", "/nonexistent/nas"):
+                    with patch.object(m, "SCRIPT_DIR", pathlib.Path(td)):
+                        with patch.object(m, "check_immich_reachable"):
+                            with patch("subprocess.run") as mock_run:
+                                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                                m.full_recovery()
+
+        commands = [c.args[0] for c in mock_run.call_args_list]
+        # Should have umount, mkdir, mount_nfs, docker restart
+        self.assertTrue(any("umount" in cmd for cmd in commands))
+        self.assertTrue(any("mount_nfs" in cmd for cmd in commands))
+        mount_call = next(cmd for cmd in commands if "mount_nfs" in cmd)
+        self.assertIn("-o", mount_call)
+        self.assertIn("resvport", mount_call)
+
+    def test_full_recovery_calls_mount_sh_when_nas_disconnected(self):
+        """full_recovery() calls sudo mount.sh when NAS mount point is missing."""
+        with tempfile.TemporaryDirectory() as td:
+            mount_script = os.path.join(td, "mount.sh")
+            with open(mount_script, "w") as f:
+                f.write("#!/bin/bash\nexit 0\n")
+            os.chmod(mount_script, 0o755)
+
+            with patch.object(m, "SCRIPT_DIR", pathlib.Path(td)):
+                with patch.object(m, "NAS_MOUNT_POINT", "/nonexistent/path"):
+                    with patch.object(m, "NAS_REMOTE", ""):
+                        with patch.object(m, "check_immich_reachable"):
+                            with patch("subprocess.run") as mock_run:
+                                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                                m.full_recovery()
+
+        sudo_mount_calls = [
+            c for c in mock_run.call_args_list
+            if c.args[0][:1] == ["sudo"] and "mount.sh" in str(c.args[0])
+        ]
+        self.assertEqual(len(sudo_mount_calls), 1, "sudo mount.sh should be called once")
+
+    def test_full_recovery_skips_mount_when_nas_already_mounted(self):
+        """full_recovery() skips mount.sh when NAS mount point already exists."""
+        with tempfile.TemporaryDirectory() as td:
+            mount_point = os.path.join(td, "nas")
+            os.makedirs(mount_point)
+
+            with patch.object(m, "NAS_MOUNT_POINT", mount_point):
+                with patch.object(m, "NAS_REMOTE", ""):
+                    with patch.object(m, "check_immich_reachable"):
+                        with patch("subprocess.run") as mock_run:
+                            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                            with patch("os.path.ismount", return_value=True):
+                                m.full_recovery()
+
+        sudo_mount_calls = [
+            c for c in mock_run.call_args_list
+            if c.args[0][:1] == ["sudo"] and "mount" in str(c.args[0])
+        ]
+        self.assertEqual(len(sudo_mount_calls), 0, "mount should not be called when NAS is already mounted")
+
+
 if __name__ == "__main__":
     unittest.main()

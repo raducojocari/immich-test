@@ -121,6 +121,19 @@ EOF
     info "docker-compose.override.yml created."
 }
 
+setup_sudoers() {
+    local mount_script="${SCRIPT_DIR}/mount.sh"
+    local sudoers_file="/etc/sudoers.d/immich-mount"
+    local current_user
+    current_user="$(whoami)"
+
+    info "Configuring passwordless sudo for mount.sh..."
+    echo "${current_user} ALL=(root) NOPASSWD: ${mount_script}" \
+        | sudo tee "${sudoers_file}" > /dev/null
+    sudo chmod 440 "${sudoers_file}"
+    info "Passwordless sudo configured: ${sudoers_file}"
+}
+
 start_immich() {
     info "Starting Immich containers..."
     "${DOCKER_CMD}" compose --project-directory "${INSTALL_DIR}" up --detach \
@@ -146,6 +159,7 @@ main() {
     download_immich_config
     configure_env
     create_compose_override
+    setup_sudoers
     start_immich
 
     info "=== Installation complete ==="
