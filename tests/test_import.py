@@ -712,5 +712,46 @@ class TestRecoveryLoop(unittest.TestCase):
         self.assertEqual(len(sudo_mount_calls), 0, "mount should not be called when NAS is already mounted")
 
 
+class TestNfsWatcher(unittest.TestCase):
+
+    def test_triggers_recovery_on_not_responding(self):
+        """Watcher sets _recovery_event when NFS 'not responding' line appears."""
+        import io
+        fake_out = io.StringIO(
+            "Filtering the log data using ...\n"
+            "nfs server 192.168.1.253:/volume/data: not responding\n"
+        )
+        mock_proc = MagicMock()
+        mock_proc.stdout = fake_out
+        mock_proc.pid = 99999
+
+        m._recovery_event.clear()
+        with patch("subprocess.Popen", return_value=mock_proc):
+            m._nfs_log_watcher()
+
+        self.assertTrue(m._recovery_event.is_set())
+        m._recovery_event.clear()
+
+    def test_ignores_unrelated_nfs_lines(self):
+        """Watcher does NOT set _recovery_event for non-'not responding' NFS lines."""
+        import io
+        fake_out = io.StringIO("nfs server 192.168.1.253:/volume/data: mounted\n")
+        mock_proc = MagicMock()
+        mock_proc.stdout = fake_out
+        mock_proc.pid = 99999
+
+        m._recovery_event.clear()
+        with patch("subprocess.Popen", return_value=mock_proc):
+            m._nfs_log_watcher()
+
+        self.assertFalse(m._recovery_event.is_set())
+
+    def test_handles_missing_log_command(self):
+        """Watcher exits cleanly if 'log' binary is not found."""
+        with patch("subprocess.Popen", side_effect=FileNotFoundError):
+            # Should not raise
+            m._nfs_log_watcher()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -267,17 +267,28 @@ sequenceDiagram
     Script->>User: === Import complete ===
 ```
 
-### In-Process Recovery Flow (HTTP 000)
+### In-Process Recovery Flow (HTTP 000 or NFS hang)
+
+Two triggers share the same `_recovery_event` path:
+
+1. **HTTP 000** — 10 consecutive connection failures from upload threads.
+2. **NFS not responding** — `nfs-watcher` daemon thread detects kernel log message
+   `nfs server <ip>:/path: not responding` via `log stream` (macOS Unified Logging).
 
 ```mermaid
 sequenceDiagram
+    participant Watcher as nfs-watcher thread
     participant Threads as Upload threads
     participant Main as Main thread (run_import)
     participant NAS
     participant Docker
 
+    Watcher->>Watcher: tail `log stream --predicate 'eventMessage CONTAINS[c] "nfs server"'`
+    Watcher->>Watcher: line matches "not responding"
+    Watcher->>Main: _recovery_event.set()
+
     Threads->>Threads: 3× connection failures → _http000_count++
-    Note over Threads: count reaches threshold (10)
+    Note over Threads: count reaches threshold (10) [alternative trigger]
     Threads->>Main: _recovery_event.set()
     Threads-->>Main: return "failed:HTTP 000"
     Main->>Threads: cancel() remaining futures
@@ -293,6 +304,16 @@ sequenceDiagram
     Main->>Main: load_checkpoint() (skip already-done)
     Main->>Threads: restart ThreadPoolExecutor → continue upload
 ```
+
+#### NFS watcher details
+
+| Aspect | Detail |
+|---|---|
+| Thread name | `nfs-watcher` (daemon — dies with main process) |
+| Command | `log stream --predicate 'eventMessage CONTAINS[c] "nfs server"'` |
+| Trigger pattern | `NFS_NOT_RESPONDING_RE = re.compile(r"nfs server .+?: not responding", re.IGNORECASE)` |
+| Graceful degradation | If `log` binary not found (old macOS), thread logs a warning and exits silently |
+| Idempotency | Checks `_recovery_event.is_set()` before setting to avoid duplicate recoveries |
 
 ## 8. Import Pipeline
 
@@ -364,6 +385,7 @@ The JSON sidecar structure:
 | Import hangs at startup | Stale `find` processes from killed runs still scanning NFS, consuming all bandwidth | `trap cleanup EXIT` kills all background jobs; `pkill -f "find /Volumes/nas"` to manually clear |
 | HTTP 000 failures on cold start | Immich not fully initialised after Docker restart despite responding to ping | `check_immich_reachable` retries every 5s for up to 60s |
 | Persistent HTTP 000 stalls mid-run | NAS drops NFS connection / Docker VirtioFS crash | In-process recovery loop: 10 failures → `full_recovery()` → remount NAS + restart Docker + wait healthy → continue from checkpoint |
+| NFS share hangs before HTTP errors | Kernel NFS layer blocks indefinitely, no HTTP 000 generated | `nfs-watcher` daemon thread detects `nfs server ... not responding` via `log stream` and immediately triggers `full_recovery()` |
 | `mktemp` fails with suffix | BSD `mktemp` requires Xs at end of template only | All `mktemp` calls use trailing-X-only templates |
 | `${var,,}` bad substitution | bash 3.2 does not support case conversion syntax | Replaced with `tr '[:upper:]' '[:lower:]'` |
 | Python `BrokenPipeError` noise | `head -N` closes pipe before python filter finishes | `2>/dev/null` on python3 filter call |

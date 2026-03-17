@@ -80,6 +80,8 @@ HTTP000_REMOUNT_THRESHOLD = 10
 # Recovery event — set by upload() when threshold is hit; cleared by run_import() on each loop
 _recovery_event = threading.Event()
 
+NFS_NOT_RESPONDING_RE = re.compile(r"nfs server .+?: not responding", re.IGNORECASE)
+
 
 def _maybe_trigger_recovery():
     """Increment the shared failure counter; trigger recovery if threshold reached."""
@@ -95,6 +97,45 @@ def _maybe_trigger_recovery():
             HTTP000_REMOUNT_THRESHOLD,
         )
         _recovery_event.set()
+
+
+def _nfs_log_watcher():
+    """Background daemon: tail macOS unified log for NFS 'not responding' kernel messages.
+    Sets _recovery_event when detected, which causes run_import() to call full_recovery()."""
+    logger.info("[NFS-WATCHER] Starting — monitoring macOS log stream for NFS errors")
+    cmd = ["log", "stream", "--predicate", 'eventMessage CONTAINS[c] "nfs server"']
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except FileNotFoundError:
+        logger.warning("[NFS-WATCHER] 'log' command not found — NFS log watching disabled")
+        return
+    except Exception as e:
+        logger.warning("[NFS-WATCHER] Could not start log stream: %s — disabled", e)
+        return
+
+    logger.info("[NFS-WATCHER] log stream running (pid=%d)", proc.pid)
+    try:
+        for line in proc.stdout:
+            if NFS_NOT_RESPONDING_RE.search(line):
+                logger.warning("[NFS-WATCHER] NFS not responding detected: %s", line.rstrip())
+                if not _recovery_event.is_set():
+                    logger.warning("[NFS-WATCHER] Triggering full recovery")
+                    _recovery_event.set()
+    except Exception as e:
+        logger.error("[NFS-WATCHER] Watcher error: %s", e)
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        logger.info("[NFS-WATCHER] log stream process terminated")
+
+
+def _start_nfs_watcher():
+    """Start the NFS log watcher as a daemon thread. Returns the thread."""
+    t = threading.Thread(target=_nfs_log_watcher, name="nfs-watcher", daemon=True)
+    t.start()
+    return t
 
 
 # Module-level logger (configured by setup_logging)
@@ -585,6 +626,7 @@ def usage():
 
 def main():
     setup_logging()
+    _start_nfs_watcher()
 
     args = set(sys.argv[1:])
     unknown = args - {"--test", "--all", "--withvideo"}
