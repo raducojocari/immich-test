@@ -15,6 +15,8 @@
 #   IMMICH_VIDEO_PARALLEL=2     concurrent video uploads (default: 2)
 #   IMMICH_TEST_COUNT=5         files for --test mode (default: 5)
 #   IMMICH_LARGE_MB=99          files larger than this are skipped (default: 99)
+#   NAS_MOUNT_POINT=/Volumes/nas      NFS mount point (default: /Volumes/nas)
+#   NAS_REMOTE=192.168.1.1:/export    NFS remote — enables auto-remount on HTTP 000
 
 import os
 import sys
@@ -27,6 +29,7 @@ import signal
 import logging
 import pathlib
 import itertools
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from http.client import HTTPConnection
 from urllib.request import Request, urlopen
@@ -45,6 +48,9 @@ MAX_PARALLEL    = int(os.environ.get("IMMICH_PARALLEL", "10"))
 VIDEO_PARALLEL  = int(os.environ.get("IMMICH_VIDEO_PARALLEL", "2"))
 LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
 PROGRESS_INTERVAL = 50
+NAS_MOUNT_POINT = os.environ.get("NAS_MOUNT_POINT", "/Volumes/nas")
+NAS_REMOTE      = os.environ.get("NAS_REMOTE", "")   # e.g. "192.168.1.100:/volume1/photos"
+REMOUNT_COOLDOWN = 60  # seconds between remounts
 
 PHOTO_EXTENSIONS = {
     "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif", "webp", "bmp",
@@ -65,6 +71,13 @@ MIME_MAP = {
 
 # Thread-local HTTP connection pool
 _local = threading.local()
+
+# NAS remount state
+_remount_lock = threading.Lock()
+_last_remount = 0.0
+_http000_count = 0
+_http000_lock = threading.Lock()
+HTTP000_REMOUNT_THRESHOLD = 10
 
 # Module-level logger (configured by setup_logging)
 logger = logging.getLogger("immich_import")
@@ -166,6 +179,36 @@ def check_nas_reachable():
     if not os.path.isdir(PHOTOS_DIR):
         logger.error("NAS no longer reachable at '%s'. Check the mount and re-run.", PHOTOS_DIR)
         sys.exit(1)
+
+
+def remount_nas():
+    """Unmount and remount the NAS. Thread-safe with cooldown to avoid storm."""
+    global _last_remount
+    with _remount_lock:
+        now = time.time()
+        if now - _last_remount < REMOUNT_COOLDOWN:
+            logger.info("Remount skipped — cooldown active (%ds since last remount)", int(now - _last_remount))
+            return
+        if not NAS_REMOTE:
+            logger.warning("HTTP 000 detected but NAS_REMOTE not set — skipping remount. "
+                           "Set NAS_REMOTE=<host>:<export> to enable auto-recovery.")
+            return
+        logger.warning("HTTP 000 detected — remounting NAS: %s -> %s", NAS_REMOTE, NAS_MOUNT_POINT)
+        try:
+            subprocess.run(["sudo", "umount", "-f", NAS_MOUNT_POINT],
+                           check=False, timeout=30, capture_output=True)
+            time.sleep(2)
+            result = subprocess.run(
+                ["sudo", "mount", "-t", "nfs", NAS_REMOTE, NAS_MOUNT_POINT],
+                check=False, timeout=30, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                _last_remount = time.time()
+                logger.info("NAS remounted successfully.")
+            else:
+                logger.error("NAS remount failed (rc=%d): %s", result.returncode, result.stderr.strip())
+        except Exception as e:
+            logger.error("NAS remount exception: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +354,15 @@ def upload(file_path: str) -> tuple:
         except Exception:
             _local.conn = None
             if attempt == 2:
+                global _http000_count
+                with _http000_lock:
+                    _http000_count += 1
+                    count = _http000_count
+                    if count >= HTTP000_REMOUNT_THRESHOLD:
+                        _http000_count = 0
+                if count >= HTTP000_REMOUNT_THRESHOLD:
+                    logger.warning("HTTP 000 threshold reached (%d) — triggering NAS remount", HTTP000_REMOUNT_THRESHOLD)
+                    remount_nas()
                 logger.warning("%s — connection failed after 3 attempts", rel)
                 return ("failed:HTTP 000", rel)
 

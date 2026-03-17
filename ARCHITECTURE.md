@@ -92,6 +92,7 @@ immich-test/
 │   ├── install.sh              # Downloads and configures Immich
 │   ├── start.sh                # Starts Docker Compose stack
 │   ├── stop.sh                 # Stops Docker Compose stack
+│   ├── reset.sh                # Wipes all Immich data for a clean start
 │   ├── mount.sh                # Mounts the NAS via NFS (requires sudo)
 │   ├── import.py               # Imports Google Photos Takeout into Immich
 │   ├── import.log              # Persistent import log (checkpoint source)
@@ -105,6 +106,7 @@ immich-test/
     ├── test_install.bats
     ├── test_start.bats
     ├── test_stop.bats
+    ├── test_reset.bats
     ├── test_import.py          # pytest tests for import.py (20 cases, no live server)
     └── helpers/
         └── common.bash         # Shared test helpers and mock binaries
@@ -136,6 +138,14 @@ immich-test/
 - `start.sh`: verify Docker installed → daemon running → compose file exists → `docker compose up -d`
 - `stop.sh`: same checks → `docker compose down`
 - Both scripts print clear error messages for each failure mode.
+
+### FR-6: Reset
+- `reset.sh`: wipe all Immich-managed data to start fresh.
+- Deletes: NAS Immich storage directory (`IMMICH_STORAGE_DIR`), Postgres data directory
+  (`<install_dir>/postgres`), and truncates `import.log` (checkpoint).
+- Preserves: `.env`, compose files, and the Google Photos source directory on the NAS.
+- Requires `--confirm` flag or interactive "yes" prompt to prevent accidental data loss.
+- All paths overridable via environment variables for testability.
 
 ### FR-4: Photo import
 - Import all media files from `/Volumes/nas/Google Photos/Radu` into Immich via its REST API.
@@ -355,6 +365,16 @@ IMMICH_API_KEY=<key> python3 output/import.py --all
 # Operational log: logs/import.log (cleared each run)
 # Checkpoint log:  output/import.log (persistent)
 ```
+
+### Step 6a — Reset everything (optional)
+To wipe all uploaded data and start over (e.g. after a misconfiguration or test run):
+```bash
+./output/reset.sh           # interactive prompt
+./output/reset.sh --confirm # non-interactive (scripted use)
+```
+This deletes the NAS Immich storage, the Postgres data directory, and clears `import.log`.
+Config files (`.env`, compose files) are preserved. Run `./output/start.sh` afterwards
+to bring up a clean empty instance.
 
 ### Step 7 — Run tests
 ```bash

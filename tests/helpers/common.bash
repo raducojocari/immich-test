@@ -28,9 +28,14 @@ setup_test_env() {
     # --- NAS directory structure ---
     mkdir -p "${TEST_NAS_DIR}/Google Photos/Radu"
 
+    export TEST_STORAGE_DIR
+    TEST_STORAGE_DIR="$(mktemp -d)"
+
     # --- Script overrides ---
     export IMMICH_NAS_MOUNT="${TEST_NAS_DIR}"
     export IMMICH_INSTALL_DIR="${TEST_INSTALL_PARENT}/install"
+    export IMMICH_STORAGE_DIR="${TEST_STORAGE_DIR}"
+    export IMMICH_IMPORT_LOG="${TEST_INSTALL_PARENT}/import.log"
 
     # Point downloads at local fixture files so tests run offline
     export IMMICH_DOCKER_COMPOSE_URL="file://${BATS_TEST_DIRNAME}/fixtures/docker-compose.yml"
@@ -49,7 +54,7 @@ setup_test_env() {
 # Cleans up all temp directories created by setup_test_env.
 # ---------------------------------------------------------------------------
 teardown_test_env() {
-    rm -rf "${MOCK_BIN_DIR:-}" "${TEST_NAS_DIR:-}" "${TEST_INSTALL_PARENT:-}"
+    rm -rf "${MOCK_BIN_DIR:-}" "${TEST_NAS_DIR:-}" "${TEST_INSTALL_PARENT:-}" "${TEST_STORAGE_DIR:-}"
 }
 
 # ---------------------------------------------------------------------------
@@ -100,5 +105,5 @@ MOCK
 #   run run_script "${MY_SCRIPT}"
 # ---------------------------------------------------------------------------
 run_script() {
-    bash -c '"$1" 2>&1' _ "$@"
+    bash -c '"$@" 2>&1' _ "$@"
 }

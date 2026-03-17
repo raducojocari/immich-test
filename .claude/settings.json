@@ -1,0 +1,31 @@
+{
+   "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    "MCP_TIMEOUT": "30000"
+  },
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:release-assets.githubusercontent.com)",
+      "Bash(chmod +x /Users/roxanacojocari/repos/immich-test/output/install.sh /Users/roxanacojocari/repos/immich-test/output/start.sh /Users/roxanacojocari/repos/immich-test/output/stop.sh)",
+      "Bash(chmod +x /Users/roxanacojocari/repos/immich-test/tests/run_tests.sh)",
+      "Bash(bash tests/run_tests.sh 2>&1)",
+      "Bash(bash output/install.sh 2>&1)",
+      "Bash(bash /Users/roxanacojocari/repos/immich-test/output/stop.sh 2>&1)",
+      "Bash(find \"/Volumes/nas/Google Photos/Radu/takeout-20250119T102838Z-001\" -type f \\\\\n  | grep -Ei '\\\\.\\(jpg|jpeg|png|gif|heic|heif|mp4|mov\\)$' \\\\\n  | wc -l)",
+      "Bash(bash /Users/roxanacojocari/repos/immich-test/output/start.sh 2>&1)",
+      "Bash(sleep 3 && curl -s http://localhost:2283/api/server/ping)",
+      "Bash(IMMICH_API_KEY=m7uBN5VepFnMJNwKym6ktCqVP5QzjJ4t7hj0YPLg bash /Users/roxanacojocari/repos/immich-test/output/import.sh --test 2>&1)",
+      "Bash(IMMICH_API_KEY=m7uBN5VepFnMJNwKym6ktCqVP5QzjJ4t7hj0YPLg bash /Users/roxanacojocari/repos/immich-test/output/import.sh --all 2>&1)",
+      "Bash(bash /Users/roxanacojocari/repos/immich-test/output/install.sh 2>&1)",
+      "Bash(IMMICH_API_KEY=m7uBN5VepFnMJNwKym6ktCqVP5QzjJ4t7hj0YPLg timeout 60 bash output/import.sh --test 2>&1)",
+      "Bash(pkill -f \"import.sh\" 2>/dev/null; pkill -f \"immich_worker\" 2>/dev/null; pkill -f \"immich_filter\" 2>/dev/null; pkill -f \"immich_date\" 2>/dev/null; sleep 1; ps aux | grep -E \"import\\\\.sh|immich_worker|xargs.*immich\" | grep -v grep || echo \"all clear\")",
+      "Bash(which immich:*)",
+      "Bash(npm install:*)",
+      "Bash(immich login:*)",
+      "Bash(kill 92757 2>/dev/null; pkill -f \"import.sh\" 2>/dev/null; echo \"done\")",
+      "Bash(brew install:*)",
+      "Bash"
+    ]
+  }
+}

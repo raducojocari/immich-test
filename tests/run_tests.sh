@@ -54,7 +54,8 @@ echo ""
     --print-output-on-failure \
     "${TESTS_DIR}/test_install.bats" \
     "${TESTS_DIR}/test_start.bats" \
-    "${TESTS_DIR}/test_stop.bats"
+    "${TESTS_DIR}/test_stop.bats" \
+    "${TESTS_DIR}/test_reset.bats"
 
 echo ""
 echo "=== Python import tests ==="

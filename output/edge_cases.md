@@ -1,6 +1,6 @@
 # Import Edge Cases
 
-_Generated from `output/import.log`. Last updated: 2026-03-16 20:35 (run in progress)_
+_Generated from `output/import.log`. Last updated: 2026-03-17 06:45 (run in progress)_
 
 ---
 
@@ -52,14 +52,33 @@ Brief transient Docker/Immich pause. Resolved.
 
 ---
 
+## Edge Case 5: Upload connection failure — HTTP 000
+
+**Occurrences:** 677 _(ongoing — last seen 2026-03-17T06:45:28Z)_
+
+**Log signature:**
+```
+FAILED    <rel_path> — HTTP 000
+```
+
+**Root cause:** HTTP 000 means no response received from Immich after 3 retries — connection
+refused, socket timeout, or NFS mount degradation causing reads to hang/drop mid-upload.
+Auto-remount triggers every 10 occurrences (requires `NAS_REMOTE` env var).
+All FAILED files will be retried on the next run (not checkpointed as done).
+
+**Status:** Active — 677 failures. NAS connection is intermittently dropping under load.
+
+---
+
 ## Summary
 
 | Edge case | Occurrences | Status |
 |-----------|-------------|--------|
-| Immich ENOTDIR storage corruption | 1045+ | **Resolved** |
+| Immich ENOTDIR storage corruption | 1045+ | Resolved |
 | NAS file read error (transient) | 14 | Resolved |
 | File not found (ENOENT) | 293 | Resolved |
 | Connection failure (3 retries) | 3 | Resolved |
+| Upload connection failure (HTTP 000) | **677** | **Active** |
 
-**Current run (2026-03-16 20:33):** Uploads succeeding — CREATED entries flowing in.
-No active blocking issues.
+**Current run (2026-03-17 06:45):** 677 HTTP 000 failures — NAS intermittently dropping.
+Auto-remount active (every 10 failures). All failed files retry on next run.
