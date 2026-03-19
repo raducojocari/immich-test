@@ -94,7 +94,9 @@ immich-test/
 │   ├── stop.sh                 # Stops Docker Compose stack
 │   ├── reset.sh                # Wipes all Immich data for a clean start
 │   ├── mount.sh                # Mounts the NAS via NFS (requires sudo)
-│   ├── import.py               # Imports Google Photos Takeout into Immich
+│   ├── import.py               # Imports Google Photos Takeout into Immich (single-pass)
+│   ├── recover.sh              # Cron-driven recovery agent (*/10 * * * *)
+│   ├── .env.local              # API key for recover.sh (gitignored)
 │   ├── import.log              # Persistent import log (checkpoint source)
 │   └── install/
 │       ├── docker-compose.yml          # Official Immich compose (do not edit)
@@ -107,7 +109,8 @@ immich-test/
     ├── test_start.bats
     ├── test_stop.bats
     ├── test_reset.bats
-    ├── test_import.py          # pytest tests for import.py (20 cases, no live server)
+    ├── test_import.py          # pytest tests for import.py (24 cases, no live server)
+    └── test_recover.bats       # BATS tests for recover.sh (11 cases)
     └── helpers/
         └── common.bash         # Shared test helpers and mock binaries
 ```
@@ -174,10 +177,13 @@ immich-test/
 - Checkpoint is derived from `import.log` — no separate state file that can get out of sync.
 - Checkpoint uses O(n+m) Python set filter: loads done-set once, streams find output — avoids
   re-reading all 151k NAS file paths for each lookup.
-- **In-process self-healing**: when 10 consecutive HTTP 000 connection failures accumulate,
-  `import.py` stops all upload threads, runs `full_recovery()` (umount → mount_nfs → docker
-  compose restart → wait for Immich healthy), then continues from checkpoint automatically.
-  No external cron or human intervention required.
+- **External recovery via `recover.sh`**: runs every 10 minutes via cron. Checks health and,
+  if anything is broken, stops the import, force-unmounts the NAS, remounts, restarts Docker,
+  waits for Immich healthy, then relaunches `import.py --all`. The checkpoint log ensures
+  import resumes from where it left off on every restart.
+- `import.py` is intentionally a simple single-pass uploader with no self-healing threads.
+  This eliminates the structural problem of a Python process trying to recover itself while
+  stuck inside hung kernel calls.
 
 ### NFR-2: macOS bash 3.2 compatibility
 - No `declare -A` (associative arrays — bash 4+ only).
@@ -267,53 +273,63 @@ sequenceDiagram
     Script->>User: === Import complete ===
 ```
 
-### In-Process Recovery Flow (HTTP 000 or NFS hang)
+### External Recovery Flow (`recover.sh` cron agent)
 
-Two triggers share the same `_recovery_event` path:
+`recover.sh` runs every 10 minutes via cron. It makes a single health decision and acts accordingly.
 
-1. **HTTP 000** — 10 consecutive connection failures from upload threads.
-2. **NFS not responding** — `nfs-watcher` daemon thread detects kernel log message
-   `nfs server <ip>:/path: not responding` via `log stream` (macOS Unified Logging).
+**Decision logic:**
+
+| Condition | Action |
+|---|---|
+| import running + Immich healthy + checkpoint age < 720 s | Skip — all healthy |
+| import NOT running + Immich healthy | Start import only (no Docker restart) |
+| anything else | Full recovery |
+
+**Full recovery sequence:** stop import → `docker compose down` → `diskutil unmount force` → `mount.sh` → `docker compose up -d` → wait for Immich healthy → start import.
 
 ```mermaid
 sequenceDiagram
-    participant Watcher as nfs-watcher thread
-    participant Threads as Upload threads
-    participant Main as Main thread (run_import)
+    participant Cron as cron (*/10 * * * *)
+    participant Recover as recover.sh
+    participant Import as import.py
     participant NAS
     participant Docker
+    participant Immich
 
-    Watcher->>Watcher: tail `log stream --predicate 'eventMessage CONTAINS[c] "nfs server"'`
-    Watcher->>Watcher: line matches "not responding"
-    Watcher->>Main: _recovery_event.set()
+    Cron->>Recover: execute recover.sh
+    Recover->>Recover: acquire PID lock (/tmp/immich_recover.lock)
+    Recover->>Recover: health check (pgrep + curl + stat)
 
-    Threads->>Threads: 3× connection failures → _http000_count++
-    Note over Threads: count reaches threshold (10) [alternative trigger]
-    Threads->>Main: _recovery_event.set()
-    Threads-->>Main: return "failed:HTTP 000"
-    Main->>Threads: cancel() remaining futures
-    Main->>Main: wait(ALL_COMPLETED)
+    alt All healthy
+        Recover->>Recover: log "All healthy — skipping"
+    else Import not running, Immich healthy
+        Recover->>Import: nohup python3 import.py --all &
+    else Unhealthy
+        Recover->>Import: SIGTERM → wait 15s → SIGKILL
+        Recover->>Docker: docker compose --project-directory install/ down
+        Recover->>NAS: sudo diskutil unmount force /Volumes/nas
+        Recover->>NAS: sudo mount.sh
+        Recover->>Docker: docker compose --project-directory install/ up -d
+        Recover->>Immich: poll /api/server/ping (24×5s)
+        Recover->>Import: nohup python3 import.py --all &
+    end
 
-    Main->>NAS: sudo umount /Volumes/nas
-    Main->>NAS: sudo mount_nfs -o resvport NAS_REMOTE /Volumes/nas
-    Main->>Docker: docker compose -f ... restart
-    Main->>Main: check_immich_reachable() (retries 12×5s)
-
-    Note over Main: full_recovery() complete
-    Main->>Main: _recovery_event.clear(), _http000_count = 0
-    Main->>Main: load_checkpoint() (skip already-done)
-    Main->>Threads: restart ThreadPoolExecutor → continue upload
+    Recover->>Recover: release PID lock
 ```
 
-#### NFS watcher details
+#### recover.sh details
 
 | Aspect | Detail |
 |---|---|
-| Thread name | `nfs-watcher` (daemon — dies with main process) |
-| Command | `log stream --predicate 'eventMessage CONTAINS[c] "nfs server"'` |
-| Trigger pattern | `NFS_NOT_RESPONDING_RE = re.compile(r"nfs server .+?: not responding", re.IGNORECASE)` |
-| Graceful degradation | If `log` binary not found (old macOS), thread logs a warning and exits silently |
-| Idempotency | Checks `_recovery_event.is_set()` before setting to avoid duplicate recoveries |
+| Invocation | `*/10 * * * * /abs/path/recover.sh >> logs/recover.log 2>&1` |
+| Setup | `./output/recover.sh --setup` installs cron entry + sudoers for diskutil |
+| PID lock | `/tmp/immich_recover.lock` — prevents concurrent recovery runs |
+| API key | Sourced from `output/.env.local` (bash 3.2-compatible line reader) |
+| Checkpoint age | `stat -f '%m'` on `import.log`; missing or empty → 99999 s (treated as stale) |
+| Stale threshold | 720 s (12 minutes) — slightly more than the 10-minute cron interval |
+| NAS unmount | `sudo diskutil unmount force` — uses DiskArbitration, non-blocking on macOS even when NFS is frozen |
+| Sudoers | `${USER} ALL=(root) NOPASSWD: /usr/sbin/diskutil` written to `/etc/sudoers.d/immich-recover` |
+| Log | `output/logs/recover.log` — rolling (not cleared on each run) |
 
 ## 8. Import Pipeline
 
@@ -324,13 +340,10 @@ find_media_files()               os.walk generator, ext filter + size < LARGE_FI
 checkpoint filter                in-line: skips relative paths already in import.log
         │
         ▼
-prechecker()                     generator: batch 50 paths → parallel SHA1 (6 threads)
-        │                        → POST /api/assets/bulk-upload-check → yield only new paths
-        ▼
-ThreadPoolExecutor(MAX_PARALLEL) submit upload() as each path arrives from generator
+ThreadPoolExecutor(MAX_PARALLEL) sliding window: pre-fill workers×3 futures, refill as each completes
         │
         ▼
-as_completed()                   process results as they finish
+wait(FIRST_COMPLETED, timeout=5) process results as they finish
         │
         ├── created   → [OK]    + log CREATED   → output/import.log
         ├── duplicate → [SKIP]  + log DUPLICATE → output/import.log
@@ -384,8 +397,8 @@ The JSON sidecar structure:
 | NAS "Permission denied" on NFS mount | This machine's IP not in Unifi NAS NFS whitelist | `mount.sh` runs `showmount -e` to detect and surfaces actionable error message |
 | Import hangs at startup | Stale `find` processes from killed runs still scanning NFS, consuming all bandwidth | `trap cleanup EXIT` kills all background jobs; `pkill -f "find /Volumes/nas"` to manually clear |
 | HTTP 000 failures on cold start | Immich not fully initialised after Docker restart despite responding to ping | `check_immich_reachable` retries every 5s for up to 60s |
-| Persistent HTTP 000 stalls mid-run | NAS drops NFS connection / Docker VirtioFS crash | In-process recovery loop: 10 failures → `full_recovery()` → remount NAS + restart Docker + wait healthy → continue from checkpoint |
-| NFS share hangs before HTTP errors | Kernel NFS layer blocks indefinitely, no HTTP 000 generated | `nfs-watcher` daemon thread detects `nfs server ... not responding` via `log stream` and immediately triggers `full_recovery()` |
+| Import crashes or NFS/Docker fails mid-run | NFS drop, VirtioFS crash, or Docker deadlock | `recover.sh` cron fires every 10 min: detects stale checkpoint or missing import process; performs full recovery (unmount → remount → docker restart → wait healthy → restart import) |
+| recover.sh hangs or crashes | Concurrent recovery run, or script itself takes > 10 min | PID lock file (`/tmp/immich_recover.lock`) prevents concurrent runs; stale locks detected by `kill -0` |
 | `mktemp` fails with suffix | BSD `mktemp` requires Xs at end of template only | All `mktemp` calls use trailing-X-only templates |
 | `${var,,}` bad substitution | bash 3.2 does not support case conversion syntax | Replaced with `tr '[:upper:]' '[:lower:]'` |
 | Python `BrokenPipeError` noise | `head -N` closes pipe before python filter finishes | `2>/dev/null` on python3 filter call |
@@ -403,10 +416,17 @@ The JSON sidecar structure:
 | `IMMICH_API_KEY` | *(required)* | Immich API key (Account Settings → API Keys) |
 | `IMMICH_URL` | `http://localhost:2283` | Immich base URL |
 | `IMMICH_PHOTOS_DIR` | `/Volumes/nas/Google Photos/Radu` | Source photo directory |
-| `IMMICH_PARALLEL` | `6` | Concurrent uploads |
+| `IMMICH_PARALLEL` | `10` | Concurrent uploads |
 | `IMMICH_LARGE_MB` | `99` | Files above this size (MB) are skipped |
 | `IMMICH_TEST_COUNT` | `5` | Number of files for `--test` mode |
-| `PRECHECKER_BATCH_SIZE` | `50` | Files per bulk-upload-check batch (SHA1 hashed in parallel with 6 threads) |
+| `NAS_MOUNT_POINT` | `/Volumes/nas` | NFS mount point |
+
+### Environment variables — recover.sh
+| Variable | Default | Description |
+|---|---|---|
+| `IMMICH_URL` | `http://localhost:2283` | Immich base URL (for health check) |
+| `NAS_MOUNT_POINT` | `/Volumes/nas` | NFS mount point to unmount/remount |
+| `IMMICH_API_KEY` | *(from `.env.local`)* | Sourced automatically from `output/.env.local` |
 
 ### Environment variables — install.sh
 | Variable | Default | Description |

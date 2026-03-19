@@ -347,47 +347,7 @@ class TestUpload(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5. Prechecker
-# ---------------------------------------------------------------------------
-class TestPrechecker(unittest.TestCase):
-
-    def test_prechecker_yields_new_files(self):
-        """bulk_upload_check returns one reject → rejected path not yielded."""
-        paths = ["/photos/new.jpg", "/photos/old.jpg"]
-        # old.jpg is already in Immich (reject)
-        mock_result = {"old.jpg"}
-
-        with patch.object(m, "PHOTOS_DIR", "/photos"):
-            with patch.object(m, "BATCH_SIZE", 50):
-                with patch.object(m, "bulk_upload_check", return_value=mock_result):
-                    dupes = []
-                    result = list(m.prechecker(iter(paths), dupes))
-
-        self.assertIn("/photos/new.jpg", result)
-        self.assertNotIn("/photos/old.jpg", result)
-        self.assertIn("old.jpg", dupes)
-
-    def test_prechecker_batches_correctly(self):
-        """120 paths with BATCH_SIZE=50 → 3 calls to bulk_upload_check."""
-        paths = [f"/photos/file{i:03d}.jpg" for i in range(120)]
-
-        call_count = {"n": 0}
-
-        def mock_bulk(batch):
-            call_count["n"] += 1
-            return set()  # no duplicates
-
-        with patch.object(m, "PHOTOS_DIR", "/photos"):
-            with patch.object(m, "BATCH_SIZE", 50):
-                with patch.object(m, "bulk_upload_check", side_effect=mock_bulk):
-                    dupes = []
-                    list(m.prechecker(iter(paths), dupes))
-
-        self.assertEqual(call_count["n"], 3)
-
-
-# ---------------------------------------------------------------------------
-# 6. Logging
+# 5. Logging
 # ---------------------------------------------------------------------------
 class TestLogging(unittest.TestCase):
 
@@ -422,31 +382,29 @@ class TestLogging(unittest.TestCase):
                 with patch.object(m, "LOG_FILE", log_file):
                     with patch.object(m, "PHOTOS_DIR", photos_dir):
                         with patch.object(m, "TEST_COUNT", 1):
-                            with patch.object(m, "check_nas_reachable"):
-                                with patch.object(
-                                    m, "upload",
-                                    return_value=("created", "test.jpg")
-                                ):
-                                    m.logger.handlers.clear()
-                                    m.setup_logging()
-                                    m.run_import("test")
-                                    m.logger.handlers.clear()
+                            with patch.object(
+                                m, "upload",
+                                return_value=("created", "test.jpg")
+                            ):
+                                m.logger.handlers.clear()
+                                m.setup_logging()
+                                m.run_import("test")
+                                m.logger.handlers.clear()
 
-                ops_log = script_dir_path / "logs" / "import.log"
-                content = ops_log.read_text()
-            self.assertTrue(len(content) > 0)
+            ops_log = script_dir_path / "logs" / "import.log"
+            content = ops_log.read_text()
+        self.assertTrue(len(content) > 0)
 
 
 import pathlib  # needed for TestLogging
 
 
 # ---------------------------------------------------------------------------
-# 7. Recovery loop
+# 6. Single-pass import
 # ---------------------------------------------------------------------------
-class TestRecoveryLoop(unittest.TestCase):
+class TestRunImportSinglePass(unittest.TestCase):
 
     def _make_photos_dir(self, td, count=3):
-        """Create `count` fake jpg files and return the photos dir path."""
         photos_dir = os.path.join(td, "photos")
         os.makedirs(photos_dir)
         for i in range(count):
@@ -454,303 +412,197 @@ class TestRecoveryLoop(unittest.TestCase):
                 f.write(b"\x00" * 10)
         return photos_dir
 
-    def test_recovery_event_causes_skip(self):
-        """upload() returns ('skipped:recovery', rel) when _recovery_event is set."""
+    def test_clean_completion_returns_true(self):
+        """run_import('all') with all uploads succeeding → returns True."""
         with tempfile.TemporaryDirectory() as td:
-            img = os.path.join(td, "photo.jpg")
-            with open(img, "wb") as f:
-                f.write(b"\x00" * 10)
-            m._recovery_event.set()
-            try:
-                with patch.object(m, "PHOTOS_DIR", td):
-                    status, rel = m.upload(img)
-            finally:
-                m._recovery_event.clear()
-        self.assertEqual(status, "skipped:recovery")
-
-    def test_http000_threshold_sets_recovery_event(self):
-        """When 10 consecutive connection failures occur, _recovery_event is set."""
-        m._recovery_event.clear()
-        with m._http000_lock:
-            m._http000_count = 0
-
-        with tempfile.TemporaryDirectory() as td:
-            img = os.path.join(td, "photo.jpg")
-            with open(img, "wb") as f:
-                f.write(b"\x00" * 10)
-
-            mock_conn = MagicMock()
-            mock_conn.request.side_effect = ConnectionError("forced failure")
-
-            with patch.object(m, "get_conn", return_value=mock_conn):
-                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
-                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
-                        with patch.object(m, "PHOTOS_DIR", td):
-                            # Drive count to threshold - 1 via the lock directly
-                            with m._http000_lock:
-                                m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
-                            status, _ = m.upload(img)
-
-        try:
-            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set at threshold")
-            self.assertEqual(status, "failed:HTTP 000")
-        finally:
-            m._recovery_event.clear()
-            with m._http000_lock:
-                m._http000_count = 0
-
-    def test_check_nas_reachable_triggers_recovery_when_nas_gone(self):
-        """check_nas_reachable() sets _recovery_event instead of exiting when NAS is gone."""
-        m._recovery_event.clear()
-        with patch.object(m, "PHOTOS_DIR", "/nonexistent/path"):
-            m.check_nas_reachable()   # must NOT raise SystemExit
-        try:
-            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set when NAS is gone")
-        finally:
-            m._recovery_event.clear()
-
-    def test_run_import_loops_after_recovery(self):
-        """run_import triggers full_recovery() and loops when _recovery_event fires."""
-        with tempfile.TemporaryDirectory() as td:
-            photos_dir = self._make_photos_dir(td, count=2)
+            photos_dir = self._make_photos_dir(td, count=3)
             log_file = os.path.join(td, "import.log")
             script_dir_path = pathlib.Path(td)
-
-            call_counts = {"upload": 0, "recovery": 0}
-
-            def fake_upload(path):
-                call_counts["upload"] += 1
-                if call_counts["upload"] == 1:
-                    # First upload triggers recovery
-                    m._recovery_event.set()
-                    return ("failed:HTTP 000", os.path.basename(path))
-                # Subsequent uploads succeed
-                return ("created", os.path.basename(path))
-
-            def fake_full_recovery():
-                call_counts["recovery"] += 1
 
             with patch.object(m, "SCRIPT_DIR", script_dir_path):
                 with patch.object(m, "LOG_FILE", log_file):
                     with patch.object(m, "PHOTOS_DIR", photos_dir):
-                        with patch.object(m, "TEST_COUNT", 2):
-                            with patch.object(m, "check_nas_reachable"):
-                                with patch.object(m, "upload", side_effect=fake_upload):
-                                    with patch.object(m, "full_recovery", side_effect=fake_full_recovery):
-                                        m.logger.handlers.clear()
-                                        m.setup_logging()
-                                        result = m.run_import("test")
-                                        m.logger.handlers.clear()
+                        with patch.object(m, "upload", return_value=("created", "photo.jpg")):
+                            m.logger.handlers.clear()
+                            m.setup_logging()
+                            result = m.run_import("all")
+                            m.logger.handlers.clear()
 
-        self.assertEqual(call_counts["recovery"], 1, "full_recovery should be called once")
-        self.assertGreater(call_counts["upload"], 1, "upload should be called more than once (loop continued)")
+        self.assertTrue(result)
 
-    def test_full_recovery_runs_docker_restart(self):
-        """full_recovery() calls docker compose restart and check_immich_reachable."""
-        with patch.object(m, "NAS_REMOTE", ""):
-            with patch.object(m, "check_immich_reachable") as mock_check:
-                with patch("subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=0, stderr="")
-                    m.full_recovery()
+    def test_skips_checkpointed_files(self):
+        """run_import('all') skips files already in the checkpoint log."""
+        with tempfile.TemporaryDirectory() as td:
+            photos_dir = self._make_photos_dir(td, count=3)
+            log_file = os.path.join(td, "import.log")
+            script_dir_path = pathlib.Path(td)
 
-        mock_check.assert_called_once()
-        # Verify docker compose restart was invoked
-        docker_calls = [
-            c for c in mock_run.call_args_list
-            if c.args[0][:3] == ["docker", "compose", "-f"]
+            # Pre-populate checkpoint with photo0.jpg and photo1.jpg
+            with open(log_file, "w") as f:
+                f.write("2026-03-14T10:00:00Z CREATED   photo0.jpg\n")
+                f.write("2026-03-14T10:00:01Z CREATED   photo1.jpg\n")
+
+            upload_calls = []
+
+            def tracking_upload(path):
+                upload_calls.append(os.path.basename(path))
+                return ("created", os.path.basename(path))
+
+            with patch.object(m, "SCRIPT_DIR", script_dir_path):
+                with patch.object(m, "LOG_FILE", log_file):
+                    with patch.object(m, "PHOTOS_DIR", photos_dir):
+                        with patch.object(m, "upload", side_effect=tracking_upload):
+                            m.logger.handlers.clear()
+                            m.setup_logging()
+                            m.run_import("all")
+                            m.logger.handlers.clear()
+
+        # Only photo2.jpg should be uploaded
+        self.assertNotIn("photo0.jpg", upload_calls)
+        self.assertNotIn("photo1.jpg", upload_calls)
+        self.assertIn("photo2.jpg", upload_calls)
+
+    def test_returns_false_on_failures(self):
+        """run_import('test') with upload failures → returns False."""
+        with tempfile.TemporaryDirectory() as td:
+            photos_dir = self._make_photos_dir(td, count=1)
+            log_file = os.path.join(td, "import.log")
+            script_dir_path = pathlib.Path(td)
+
+            with patch.object(m, "SCRIPT_DIR", script_dir_path):
+                with patch.object(m, "LOG_FILE", log_file):
+                    with patch.object(m, "PHOTOS_DIR", photos_dir):
+                        with patch.object(m, "TEST_COUNT", 1):
+                            with patch.object(
+                                m, "upload", return_value=("failed:HTTP 500", "photo0.jpg")
+                            ):
+                                m.logger.handlers.clear()
+                                m.setup_logging()
+                                result = m.run_import("test")
+                                m.logger.handlers.clear()
+
+        self.assertFalse(result)
+
+
+import time  # retained for any time-related assertions
+
+
+# ---------------------------------------------------------------------------
+# 7. Load failures
+# ---------------------------------------------------------------------------
+class TestLoadFailures(unittest.TestCase):
+
+    def test_load_failures_empty(self):
+        """No import.log → returns empty set."""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(m, "LOG_FILE", os.path.join(td, "import.log")):
+                result = m.load_failures()
+        self.assertEqual(result, set())
+
+    def test_load_failures_parses_failed_lines(self):
+        """FAILED lines → included in failures set with path (not error detail)."""
+        lines = [
+            "2026-03-14T10:00:00Z FAILED    Photos/bad.jpg — HTTP 500",
+            "2026-03-14T10:00:01Z FAILED    Photos/other.jpg — HTTP 000",
         ]
-        self.assertEqual(len(docker_calls), 1)
-        self.assertIn("restart", docker_calls[0].args[0])
-
-    def test_read_error_triggers_recovery(self):
-        """A burst of NAS read errors (build_multipart IOError) sets _recovery_event."""
-        m._recovery_event.clear()
-        with m._http000_lock:
-            m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
-
+        content = _make_log(lines)
         with tempfile.TemporaryDirectory() as td:
-            img = os.path.join(td, "photo.jpg")
-            with open(img, "wb") as f:
-                f.write(b"\x00" * 10)
+            log_path = os.path.join(td, "import.log")
+            with open(log_path, "w") as f:
+                f.write(content)
+            with patch.object(m, "LOG_FILE", log_path):
+                result = m.load_failures()
+        self.assertIn("Photos/bad.jpg", result)
+        self.assertIn("Photos/other.jpg", result)
+        self.assertEqual(len(result), 2)
 
-            # Make build_multipart raise IOError (NAS dropped)
-            with patch.object(m, "build_multipart", side_effect=IOError("NAS read error")):
-                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
-                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
-                        with patch.object(m, "PHOTOS_DIR", td):
-                            status, _ = m.upload(img)
-
-        try:
-            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set on read error threshold")
-            self.assertEqual(status, "failed:read error")
-        finally:
-            m._recovery_event.clear()
-            with m._http000_lock:
-                m._http000_count = 0
-
-    def test_http500_storage_failure_triggers_recovery(self):
-        """HTTP 500 'Failed to upload asset' at threshold sets _recovery_event."""
-        m._recovery_event.clear()
-        with m._http000_lock:
-            m._http000_count = m.HTTP000_REMOUNT_THRESHOLD - 1
-
-        with tempfile.TemporaryDirectory() as td:
-            img = os.path.join(td, "photo.jpg")
-            with open(img, "wb") as f:
-                f.write(b"\x00" * 10)
-
-            mock_resp = MagicMock()
-            mock_resp.status = 500
-            mock_resp.read.return_value = (
-                b'{"message":"Failed to upload asset","error":"Internal Server Error","statusCode":500}'
-            )
-            mock_conn = MagicMock()
-            mock_conn.getresponse.return_value = mock_resp
-
-            with patch.object(m, "get_conn", return_value=mock_conn):
-                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
-                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
-                        with patch.object(m, "PHOTOS_DIR", td):
-                            status, _ = m.upload(img)
-
-        try:
-            self.assertTrue(m._recovery_event.is_set(), "recovery event should be set on storage-failure 500 threshold")
-            self.assertEqual(status, "failed:HTTP 500")
-        finally:
-            m._recovery_event.clear()
-            with m._http000_lock:
-                m._http000_count = 0
-
-    def test_http500_other_error_does_not_trigger_recovery(self):
-        """HTTP 500 with non-storage message does NOT count toward recovery threshold."""
-        m._recovery_event.clear()
-        with m._http000_lock:
-            m._http000_count = 0
-
-        with tempfile.TemporaryDirectory() as td:
-            img = os.path.join(td, "photo.jpg")
-            with open(img, "wb") as f:
-                f.write(b"\x00" * 10)
-
-            mock_resp = MagicMock()
-            mock_resp.status = 500
-            mock_resp.read.return_value = b'{"message":"Unsupported file type","statusCode":500}'
-            mock_conn = MagicMock()
-            mock_conn.getresponse.return_value = mock_resp
-
-            with patch.object(m, "get_conn", return_value=mock_conn):
-                with patch.object(m, "get_taken_at", return_value="2020-01-01T00:00:00.000Z"):
-                    with patch.dict(os.environ, {"IMMICH_API_KEY": "testkey"}):
-                        with patch.object(m, "PHOTOS_DIR", td):
-                            status, _ = m.upload(img)
-
-        self.assertFalse(m._recovery_event.is_set(), "non-storage 500 should not set recovery event")
-        self.assertEqual(status, "failed:HTTP 500")
-        with m._http000_lock:
-            self.assertEqual(m._http000_count, 0)
-
-    def test_full_recovery_remounts_nas_when_remote_set(self):
-        """full_recovery() falls back to umount + mount_nfs when NAS_REMOTE is set and mount.sh absent."""
-        with tempfile.TemporaryDirectory() as td:
-            # No mount.sh in td → NAS_REMOTE fallback path is exercised
-            with patch.object(m, "NAS_REMOTE", "192.168.1.1:/export"):
-                with patch.object(m, "NAS_MOUNT_POINT", "/nonexistent/nas"):
-                    with patch.object(m, "SCRIPT_DIR", pathlib.Path(td)):
-                        with patch.object(m, "check_immich_reachable"):
-                            with patch("subprocess.run") as mock_run:
-                                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-                                m.full_recovery()
-
-        commands = [c.args[0] for c in mock_run.call_args_list]
-        # Should have umount, mkdir, mount_nfs, docker restart
-        self.assertTrue(any("umount" in cmd for cmd in commands))
-        self.assertTrue(any("mount_nfs" in cmd for cmd in commands))
-        mount_call = next(cmd for cmd in commands if "mount_nfs" in cmd)
-        self.assertIn("-o", mount_call)
-        self.assertIn("resvport", mount_call)
-
-    def test_full_recovery_calls_mount_sh_when_nas_disconnected(self):
-        """full_recovery() calls sudo mount.sh when NAS mount point is missing."""
-        with tempfile.TemporaryDirectory() as td:
-            mount_script = os.path.join(td, "mount.sh")
-            with open(mount_script, "w") as f:
-                f.write("#!/bin/bash\nexit 0\n")
-            os.chmod(mount_script, 0o755)
-
-            with patch.object(m, "SCRIPT_DIR", pathlib.Path(td)):
-                with patch.object(m, "NAS_MOUNT_POINT", "/nonexistent/path"):
-                    with patch.object(m, "NAS_REMOTE", ""):
-                        with patch.object(m, "check_immich_reachable"):
-                            with patch("subprocess.run") as mock_run:
-                                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-                                m.full_recovery()
-
-        sudo_mount_calls = [
-            c for c in mock_run.call_args_list
-            if c.args[0][:1] == ["sudo"] and "mount.sh" in str(c.args[0])
+    def test_load_failures_ignores_created_and_duplicate(self):
+        """CREATED and DUPLICATE lines → NOT in failures set."""
+        lines = [
+            "2026-03-14T10:00:00Z CREATED   Photos/good.jpg",
+            "2026-03-14T10:00:01Z DUPLICATE Photos/dupe.jpg",
+            "2026-03-14T10:00:02Z FAILED    Photos/bad.jpg — HTTP 500",
         ]
-        self.assertEqual(len(sudo_mount_calls), 1, "sudo mount.sh should be called once")
-
-    def test_full_recovery_skips_mount_when_nas_already_mounted(self):
-        """full_recovery() skips mount.sh when NAS mount point already exists."""
+        content = _make_log(lines)
         with tempfile.TemporaryDirectory() as td:
-            mount_point = os.path.join(td, "nas")
-            os.makedirs(mount_point)
-
-            with patch.object(m, "NAS_MOUNT_POINT", mount_point):
-                with patch.object(m, "NAS_REMOTE", ""):
-                    with patch.object(m, "check_immich_reachable"):
-                        with patch("subprocess.run") as mock_run:
-                            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-                            with patch("os.path.ismount", return_value=True):
-                                m.full_recovery()
-
-        sudo_mount_calls = [
-            c for c in mock_run.call_args_list
-            if c.args[0][:1] == ["sudo"] and "mount" in str(c.args[0])
-        ]
-        self.assertEqual(len(sudo_mount_calls), 0, "mount should not be called when NAS is already mounted")
+            log_path = os.path.join(td, "import.log")
+            with open(log_path, "w") as f:
+                f.write(content)
+            with patch.object(m, "LOG_FILE", log_path):
+                result = m.load_failures()
+        self.assertNotIn("Photos/good.jpg", result)
+        self.assertNotIn("Photos/dupe.jpg", result)
+        self.assertIn("Photos/bad.jpg", result)
+        self.assertEqual(len(result), 1)
 
 
-class TestNfsWatcher(unittest.TestCase):
+# Extend TestRunImportSinglePass with failures-mode tests
+class TestRunImportFailuresMode(unittest.TestCase):
 
-    def test_triggers_recovery_on_not_responding(self):
-        """Watcher sets _recovery_event when NFS 'not responding' line appears."""
-        import io
-        fake_out = io.StringIO(
-            "Filtering the log data using ...\n"
-            "nfs server 192.168.1.253:/volume/data: not responding\n"
-        )
-        mock_proc = MagicMock()
-        mock_proc.stdout = fake_out
-        mock_proc.pid = 99999
+    def _make_photos_dir(self, td, filenames):
+        photos_dir = os.path.join(td, "photos")
+        os.makedirs(photos_dir)
+        for fname in filenames:
+            with open(os.path.join(photos_dir, fname), "wb") as f:
+                f.write(b"\x00" * 10)
+        return photos_dir
 
-        m._recovery_event.clear()
-        with patch("subprocess.Popen", return_value=mock_proc):
-            m._nfs_log_watcher()
+    def test_failures_mode_retries_only_failed_files(self):
+        """--failures mode: only files with FAILED entries are uploaded."""
+        with tempfile.TemporaryDirectory() as td:
+            photos_dir = self._make_photos_dir(td, ["good.jpg", "bad.jpg"])
+            log_file = os.path.join(td, "import.log")
+            script_dir_path = pathlib.Path(td)
 
-        self.assertTrue(m._recovery_event.is_set())
-        m._recovery_event.clear()
+            # Pre-populate log: good.jpg succeeded, bad.jpg failed
+            with open(log_file, "w") as f:
+                f.write("2026-03-14T10:00:00Z CREATED   good.jpg\n")
+                f.write("2026-03-14T10:00:01Z FAILED    bad.jpg — HTTP 500\n")
 
-    def test_ignores_unrelated_nfs_lines(self):
-        """Watcher does NOT set _recovery_event for non-'not responding' NFS lines."""
-        import io
-        fake_out = io.StringIO("nfs server 192.168.1.253:/volume/data: mounted\n")
-        mock_proc = MagicMock()
-        mock_proc.stdout = fake_out
-        mock_proc.pid = 99999
+            upload_calls = []
 
-        m._recovery_event.clear()
-        with patch("subprocess.Popen", return_value=mock_proc):
-            m._nfs_log_watcher()
+            def tracking_upload(path):
+                name = os.path.basename(path)
+                upload_calls.append(name)
+                return ("created", name)
 
-        self.assertFalse(m._recovery_event.is_set())
+            with patch.object(m, "SCRIPT_DIR", script_dir_path):
+                with patch.object(m, "LOG_FILE", log_file):
+                    with patch.object(m, "PHOTOS_DIR", photos_dir):
+                        with patch.object(m, "upload", side_effect=tracking_upload):
+                            m.logger.handlers.clear()
+                            m.setup_logging()
+                            result = m.run_import("failures")
+                            m.logger.handlers.clear()
 
-    def test_handles_missing_log_command(self):
-        """Watcher exits cleanly if 'log' binary is not found."""
-        with patch("subprocess.Popen", side_effect=FileNotFoundError):
-            # Should not raise
-            m._nfs_log_watcher()
+        self.assertIn("bad.jpg", upload_calls)
+        self.assertNotIn("good.jpg", upload_calls)
+        self.assertTrue(result)
+
+    def test_failures_mode_returns_true_when_no_failures(self):
+        """--failures mode: no FAILED entries in log → returns True without uploads."""
+        with tempfile.TemporaryDirectory() as td:
+            photos_dir = self._make_photos_dir(td, ["photo.jpg"])
+            log_file = os.path.join(td, "import.log")
+            script_dir_path = pathlib.Path(td)
+
+            # Log has only CREATED entries — no failures
+            with open(log_file, "w") as f:
+                f.write("2026-03-14T10:00:00Z CREATED   photo.jpg\n")
+
+            upload_calls = []
+
+            with patch.object(m, "SCRIPT_DIR", script_dir_path):
+                with patch.object(m, "LOG_FILE", log_file):
+                    with patch.object(m, "PHOTOS_DIR", photos_dir):
+                        with patch.object(m, "upload", side_effect=lambda p: upload_calls.append(p) or ("created", p)):
+                            m.logger.handlers.clear()
+                            m.setup_logging()
+                            result = m.run_import("failures")
+                            m.logger.handlers.clear()
+
+        self.assertEqual(upload_calls, [])
+        self.assertTrue(result)
 
 
 if __name__ == "__main__":

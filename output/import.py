@@ -6,6 +6,7 @@
 #   IMMICH_API_KEY=<key> python3 output/import.py --all               # all photos
 #   IMMICH_API_KEY=<key> python3 output/import.py --all --withvideo   # all videos only
 #   IMMICH_API_KEY=<key> python3 output/import.py --test --withvideo  # 5 sample videos
+#   IMMICH_API_KEY=<key> python3 output/import.py --failures          # retry failed files
 #
 # The script is safe to re-run — files already in the log are skipped without
 # touching the NAS, so it resumes cleanly after a crash or interruption.
@@ -16,21 +17,18 @@
 #   IMMICH_TEST_COUNT=5         files for --test mode (default: 5)
 #   IMMICH_LARGE_MB=99          files larger than this are skipped (default: 99)
 #   NAS_MOUNT_POINT=/Volumes/nas      NFS mount point (default: /Volumes/nas)
-#   NAS_REMOTE=192.168.1.1:/export    NFS remote — enables auto-remount on HTTP 000
 
 import os
 import sys
+import re
 import json
 import datetime
 import threading
 import time
-import re
-import signal
 import logging
 import pathlib
 import itertools
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
@@ -49,8 +47,6 @@ VIDEO_PARALLEL  = int(os.environ.get("IMMICH_VIDEO_PARALLEL", "2"))
 LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
 PROGRESS_INTERVAL = 50
 NAS_MOUNT_POINT = os.environ.get("NAS_MOUNT_POINT", "/Volumes/nas")
-NAS_REMOTE      = os.environ.get("NAS_REMOTE", "")   # e.g. "192.168.1.100:/volume1/photos"
-DOCKER_COMPOSE_FILE = os.path.join(SCRIPT_DIR, "install", "docker-compose.yml")
 
 PHOTO_EXTENSIONS = {
     "jpg", "jpeg", "png", "gif", "heic", "heif", "tiff", "tif", "webp", "bmp",
@@ -71,72 +67,6 @@ MIME_MAP = {
 
 # Thread-local HTTP connection pool
 _local = threading.local()
-
-# NAS remount state
-_http000_count = 0
-_http000_lock = threading.Lock()
-HTTP000_REMOUNT_THRESHOLD = 10
-
-# Recovery event — set by upload() when threshold is hit; cleared by run_import() on each loop
-_recovery_event = threading.Event()
-
-NFS_NOT_RESPONDING_RE = re.compile(r"nfs server .+?: not responding", re.IGNORECASE)
-
-
-def _maybe_trigger_recovery():
-    """Increment the shared failure counter; trigger recovery if threshold reached."""
-    global _http000_count
-    with _http000_lock:
-        _http000_count += 1
-        count = _http000_count
-        if count >= HTTP000_REMOUNT_THRESHOLD:
-            _http000_count = 0
-    if count >= HTTP000_REMOUNT_THRESHOLD:
-        logger.warning(
-            "Failure threshold reached (%d) — triggering full recovery",
-            HTTP000_REMOUNT_THRESHOLD,
-        )
-        _recovery_event.set()
-
-
-def _nfs_log_watcher():
-    """Background daemon: tail macOS unified log for NFS 'not responding' kernel messages.
-    Sets _recovery_event when detected, which causes run_import() to call full_recovery()."""
-    logger.info("[NFS-WATCHER] Starting — monitoring macOS log stream for NFS errors")
-    cmd = ["log", "stream", "--predicate", 'eventMessage CONTAINS[c] "nfs server"']
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    except FileNotFoundError:
-        logger.warning("[NFS-WATCHER] 'log' command not found — NFS log watching disabled")
-        return
-    except Exception as e:
-        logger.warning("[NFS-WATCHER] Could not start log stream: %s — disabled", e)
-        return
-
-    logger.info("[NFS-WATCHER] log stream running (pid=%d)", proc.pid)
-    try:
-        for line in proc.stdout:
-            if NFS_NOT_RESPONDING_RE.search(line):
-                logger.warning("[NFS-WATCHER] NFS not responding detected: %s", line.rstrip())
-                if not _recovery_event.is_set():
-                    logger.warning("[NFS-WATCHER] Triggering full recovery")
-                    _recovery_event.set()
-    except Exception as e:
-        logger.error("[NFS-WATCHER] Watcher error: %s", e)
-    finally:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        logger.info("[NFS-WATCHER] log stream process terminated")
-
-
-def _start_nfs_watcher():
-    """Start the NFS log watcher as a daemon thread. Returns the thread."""
-    t = threading.Thread(target=_nfs_log_watcher, name="nfs-watcher", daemon=True)
-    t.start()
-    return t
-
 
 # Module-level logger (configured by setup_logging)
 logger = logging.getLogger("immich_import")
@@ -234,73 +164,6 @@ def check_immich_reachable():
     logger.info("Immich reachable. API key valid.")
 
 
-def check_nas_reachable():
-    if not os.path.isdir(PHOTOS_DIR):
-        logger.error(
-            "NAS no longer reachable at '%s' — triggering full recovery", PHOTOS_DIR
-        )
-        _recovery_event.set()
-
-
-def full_recovery():
-    """Stop uploads, remount NAS, restart Docker, wait for Immich. Called from main loop."""
-    logger.warning("=== FULL RECOVERY START: remounting NAS + restarting Docker ===")
-
-    # 1. Remount NAS
-    mount_script = os.path.join(SCRIPT_DIR, "mount.sh")
-    nas_mounted = os.path.ismount(NAS_MOUNT_POINT)
-    if not nas_mounted:
-        if os.path.isfile(mount_script):
-            logger.warning("NAS not mounted — running sudo mount.sh: %s", mount_script)
-            result = subprocess.run(
-                ["sudo", mount_script],
-                check=False, timeout=60, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                logger.info("NAS remounted via mount.sh: %s", result.stdout.strip())
-            else:
-                logger.error("mount.sh failed (rc=%d): %s", result.returncode,
-                             result.stderr.strip())
-        elif NAS_REMOTE:
-            logger.warning("Unmounting NAS: %s", NAS_MOUNT_POINT)
-            subprocess.run(["sudo", "umount", "-f", NAS_MOUNT_POINT],
-                           check=False, timeout=30, capture_output=True, stdin=subprocess.DEVNULL)
-            time.sleep(2)
-            subprocess.run(["sudo", "mkdir", "-p", NAS_MOUNT_POINT],
-                           check=False, timeout=10, stdin=subprocess.DEVNULL)
-            result = subprocess.run(
-                ["sudo", "mount_nfs", "-o", "resvport", NAS_REMOTE, NAS_MOUNT_POINT],
-                check=False, timeout=30, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                logger.info("NAS remounted successfully.")
-            else:
-                logger.error("NAS remount failed (rc=%d): %s", result.returncode,
-                             result.stderr.strip())
-        else:
-            logger.warning("NAS not mounted, mount.sh not found, and NAS_REMOTE not set "
-                           "— Docker restart will likely fail")
-    else:
-        logger.info("NAS still mounted at %s — skipping remount", NAS_MOUNT_POINT)
-
-    # 2. Restart Docker containers
-    logger.warning("Restarting Docker containers: %s", DOCKER_COMPOSE_FILE)
-    result = subprocess.run(
-        ["docker", "compose", "-f", DOCKER_COMPOSE_FILE, "restart"],
-        check=False, timeout=120, capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        logger.info("Docker containers restarted.")
-    else:
-        logger.error("Docker restart failed (rc=%d): %s", result.returncode, result.stderr.strip())
-
-    # 3. Wait for Immich to be healthy
-    logger.info("Waiting for Immich to become healthy...")
-    check_immich_reachable()  # retries 12×5s with logging
-
-    logger.warning("=== FULL RECOVERY COMPLETE — resuming import ===")
-
-
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
@@ -318,6 +181,24 @@ def load_checkpoint() -> set:
     if done:
         logger.info("Checkpoint: %d already processed — will skip.", len(done))
     return done
+
+
+def load_failures() -> set:
+    """Parse import.log and return a set of relative paths that previously failed."""
+    failed = set()
+    if not os.path.isfile(LOG_FILE):
+        return failed
+    pattern = re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z FAILED\s+(.+?)\s+—\s+.+$"
+    )
+    with open(LOG_FILE) as f:
+        for line in f:
+            match = pattern.match(line.rstrip("\n"))
+            if match:
+                failed.add(match.group(1))
+    if failed:
+        logger.info("Found %d previously failed files to retry.", len(failed))
+    return failed
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +226,6 @@ def find_media_files(extensions=MEDIA_EXTENSIONS):
             except OSError:
                 continue
             yield full
-
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +285,6 @@ def upload(file_path: str) -> tuple:
     prefix = PHOTOS_DIR.rstrip("/") + "/"
     rel = file_path[len(prefix):] if file_path.startswith(prefix) else file_path
 
-    if _recovery_event.is_set():
-        return ("skipped:recovery", rel)
     mime = get_mime_type(file_path)
     try:
         taken_at = get_taken_at(file_path)
@@ -424,7 +302,6 @@ def upload(file_path: str) -> tuple:
         body = build_multipart(fields, file_path, mime)
     except Exception as e:
         logger.warning("read failed %s: %s", rel, e)
-        _maybe_trigger_recovery()
         return ("failed:read error", rel)
 
     ctype = "multipart/form-data; boundary=----immichboundary"
@@ -448,7 +325,6 @@ def upload(file_path: str) -> tuple:
         except Exception:
             _local.conn = None
             if attempt == 2:
-                _maybe_trigger_recovery()
                 logger.warning("%s — connection failed after 3 attempts", rel)
                 return ("failed:HTTP 000", rel)
 
@@ -459,8 +335,6 @@ def upload(file_path: str) -> tuple:
             status = "created"
     else:
         logger.warning("%s — HTTP %d: %s", rel, code, rbody)
-        if code == 500 and "Failed to upload asset" in rbody:
-            _maybe_trigger_recovery()
         status = f"failed:HTTP {code}"
     return (status, rel)
 
@@ -485,9 +359,7 @@ def print_progress(processed, created, dupes, failed, start_time):
 # Main import runner
 # ---------------------------------------------------------------------------
 def run_import(mode: str, with_video: bool = False) -> bool:
-    """Orchestrate the import. Returns True if no failures. Loops on recovery."""
-    global _http000_count
-
+    """Single-pass import. Returns True if no failures."""
     extensions = VIDEO_EXTENSIONS if with_video else PHOTO_EXTENSIONS
     media_type = "video" if with_video else "photo"
     workers = VIDEO_PARALLEL if with_video else MAX_PARALLEL
@@ -496,128 +368,108 @@ def run_import(mode: str, with_video: bool = False) -> bool:
 
     log_checkpoint(f"=== Import started (mode={mode}, media={media_type}, parallel={workers}) ===")
 
-    total_created = total_dupes = total_failed = total_processed = 0
+    checkpoint = load_checkpoint()
+    skipped = len(checkpoint)
 
-    while True:
-        _recovery_event.clear()
-        with _http000_lock:
-            _http000_count = 0
+    created = dupes = failed = processed = 0
 
-        checkpoint = load_checkpoint()
-        skipped = len(checkpoint)
-
-        created = dupes = failed = processed = 0
-
-        if mode == "test":
-            logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
-        else:
-            logger.info(
-                "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
-                media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
-            )
-
-        # Build file source
-        all_files = find_media_files(extensions)
-
-        if mode == "test":
-            source = itertools.islice(all_files, TEST_COUNT)
-        else:
-            def filtered():
-                for p in all_files:
-                    rel = p[len(prefix):] if p.startswith(prefix) else p
-                    if rel not in checkpoint:
-                        yield p
-
-            source = filtered()
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            path_iter = iter(source)
-            pending = set()
-
-            for path in itertools.islice(path_iter, workers * 3):
-                pending.add(pool.submit(upload, path))
-
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    status, rel = fut.result()
-                    if status == "skipped:recovery":
-                        continue   # don't count, don't checkpoint
-
-                    processed += 1
-
-                    if status == "created":
-                        created += 1
-                        logger.info("[OK]    (%d) %s", processed, rel)
-                        log_checkpoint(f"CREATED   {rel}")
-                    elif status == "duplicate":
-                        dupes += 1
-                        logger.info("[SKIP]  (%d) %s", processed, rel)
-                        log_checkpoint(f"DUPLICATE {rel}")
-                    else:
-                        failed += 1
-                        detail = status[len("failed:"):] if status.startswith("failed:") else status
-                        logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
-                        log_checkpoint(f"FAILED    {rel} — {detail}")
-
-                    if processed % PROGRESS_INTERVAL == 0:
-                        check_nas_reachable()
-                        print_progress(processed, created, dupes, failed, start_time)
-
-                if _recovery_event.is_set():
-                    # Drain remaining futures (they'll return skipped:recovery)
-                    for f in pending:
-                        f.cancel()
-                    if pending:
-                        wait(pending, return_when=ALL_COMPLETED)
-                    break   # exit while-pending loop
-
-                try:
-                    pending.add(pool.submit(upload, next(path_iter)))
-                except StopIteration:
-                    pass
-
-        total_created += created
-        total_dupes += dupes
-        total_failed += failed
-        total_processed += processed
-
-        if _recovery_event.is_set():
-            full_recovery()
-            logger.info("Resuming import from checkpoint...")
-            continue   # loop back: reload checkpoint, restart thread pool
-
-        # Normal completion
-        elapsed = int(time.time()) - start_time
-
-        logger.info("")
-        logger.info("=== Import complete ===")
-        logger.info("  Imported  : %d", total_created)
-        logger.info("  Duplicates: %d", total_dupes)
-        logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
-        logger.info("  Failed    : %d", total_failed)
-        logger.info("  Processed : %d", total_processed)
-        logger.info("  Elapsed   : %s", format_duration(elapsed))
-        logger.info("  Log       : %s", LOG_FILE)
-
-        log_checkpoint(
-            f"=== Import finished: created={total_created} duplicate={total_dupes} "
-            f"skipped={skipped} failed={total_failed} elapsed={elapsed}s ==="
+    if mode == "test":
+        logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
+    else:
+        logger.info(
+            "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
+            media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
         )
 
-        return total_failed == 0
+    # Build file source
+    all_files = find_media_files(extensions)
+
+    if mode == "test":
+        source = itertools.islice(all_files, TEST_COUNT)
+    elif mode == "failures":
+        failed_set = load_failures()
+        if not failed_set:
+            logger.info("No failed files in log — nothing to retry.")
+            return True
+        logger.info(
+            "Retrying %d previously failed %s files...", len(failed_set), media_type
+        )
+        def failures_only():
+            for p in all_files:
+                rel = p[len(prefix):] if p.startswith(prefix) else p
+                if rel in failed_set and rel not in checkpoint:
+                    yield p
+        source = failures_only()
+    else:
+        def filtered():
+            for p in all_files:
+                rel = p[len(prefix):] if p.startswith(prefix) else p
+                if rel not in checkpoint:
+                    yield p
+        source = filtered()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        path_iter = iter(source)
+        pending = set()
+        for path in itertools.islice(path_iter, workers * 3):
+            pending.add(pool.submit(upload, path))
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED, timeout=5)
+            for fut in done:
+                status, rel = fut.result()
+                processed += 1
+                if status == "created":
+                    created += 1
+                    logger.info("[OK]    (%d) %s", processed, rel)
+                    log_checkpoint(f"CREATED   {rel}")
+                elif status == "duplicate":
+                    dupes += 1
+                    logger.info("[SKIP]  (%d) %s", processed, rel)
+                    log_checkpoint(f"DUPLICATE {rel}")
+                else:
+                    failed += 1
+                    detail = status[len("failed:"):] if status.startswith("failed:") else status
+                    logger.warning("[WARN]  (%d) %s — %s", processed, rel, detail)
+                    log_checkpoint(f"FAILED    {rel} — {detail}")
+                if processed % PROGRESS_INTERVAL == 0:
+                    print_progress(processed, created, dupes, failed, start_time)
+            try:
+                pending.add(pool.submit(upload, next(path_iter)))
+            except StopIteration:
+                pass
+
+    elapsed = int(time.time()) - start_time
+
+    logger.info("")
+    logger.info("=== Import complete ===")
+    logger.info("  Imported  : %d", created)
+    logger.info("  Duplicates: %d", dupes)
+    logger.info("  Skipped   : %d (already processed in a prior run)", skipped)
+    logger.info("  Failed    : %d", failed)
+    logger.info("  Processed : %d", processed)
+    logger.info("  Elapsed   : %s", format_duration(elapsed))
+    logger.info("  Log       : %s", LOG_FILE)
+
+    log_checkpoint(
+        f"=== Import finished: created={created} duplicate={dupes} "
+        f"skipped={skipped} failed={failed} elapsed={elapsed}s ==="
+    )
+
+    return failed == 0
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def usage():
-    print(f"Usage: IMMICH_API_KEY=<key> python3 {sys.argv[0]} [--test|--all] [--withvideo]")
+    print(f"Usage: IMMICH_API_KEY=<key> python3 {sys.argv[0]} [--test|--all|--failures] [--withvideo]")
     print("")
     print(f"  --test                Upload {TEST_COUNT} sample photos (default)")
     print("  --all                 Upload all photos")
+    print("  --failures            Retry only previously failed files")
     print("  --all --withvideo     Upload all videos only")
     print("  --test --withvideo    Upload first 5 sample videos")
+    print("  --failures --withvideo  Retry failed video files only")
     print("")
     print(f"  IMMICH_PARALLEL={MAX_PARALLEL}          concurrent photo uploads (default: 10)")
     print(f"  IMMICH_VIDEO_PARALLEL={VIDEO_PARALLEL}    concurrent video uploads (default: 2)")
@@ -626,14 +478,23 @@ def usage():
 
 def main():
     setup_logging()
-    _start_nfs_watcher()
 
     args = set(sys.argv[1:])
-    unknown = args - {"--test", "--all", "--withvideo"}
+    unknown = args - {"--test", "--all", "--withvideo", "--failures"}
     if unknown:
         logger.error("Unknown flag: %s", next(iter(unknown)))
         usage()
-    mode = "all" if "--all" in args else "test"
+
+    if "--failures" in args and ("--all" in args or "--test" in args):
+        logger.error("--failures cannot be combined with --all or --test")
+        usage()
+
+    if "--failures" in args:
+        mode = "failures"
+    elif "--all" in args:
+        mode = "all"
+    else:
+        mode = "test"
     with_video = "--withvideo" in args
 
     logger.info("=== Immich Importer ===")

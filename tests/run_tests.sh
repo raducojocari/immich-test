@@ -55,7 +55,8 @@ echo ""
     "${TESTS_DIR}/test_install.bats" \
     "${TESTS_DIR}/test_start.bats" \
     "${TESTS_DIR}/test_stop.bats" \
-    "${TESTS_DIR}/test_reset.bats"
+    "${TESTS_DIR}/test_reset.bats" \
+    "${TESTS_DIR}/test_recover.bats"
 
 echo ""
 echo "=== Python import tests ==="

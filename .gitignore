@@ -2,6 +2,9 @@
 output/install/.env
 output/install/postgres/
 
+# Local env with API key — never commit
+output/.env.local
+
 # Operational logs (cleared on each run)
 logs/
 
