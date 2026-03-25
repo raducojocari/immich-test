@@ -15,9 +15,12 @@
 #   IMMICH_PARALLEL=10          concurrent photo uploads (default: 10)
 #   IMMICH_VIDEO_PARALLEL=2     concurrent video uploads (default: 2)
 #   IMMICH_TEST_COUNT=5         files for --test mode (default: 5)
-#   IMMICH_LARGE_MB=99          files larger than this are skipped (default: 99)
+#   IMMICH_LARGE_MB=99          photo files larger than this MB are skipped (default: 99)
+#   IMMICH_VIDEO_LARGE_MB=4096  video files larger than this MB are skipped (default: 4096)
 #   NAS_MOUNT_POINT=/Volumes/nas      NFS mount point (default: /Volumes/nas)
 
+import atexit
+import io
 import os
 import sys
 import re
@@ -44,7 +47,8 @@ TEST_COUNT      = int(os.environ.get("IMMICH_TEST_COUNT", "5"))
 LOG_FILE        = str(SCRIPT_DIR / "import.log")
 MAX_PARALLEL    = int(os.environ.get("IMMICH_PARALLEL", "10"))
 VIDEO_PARALLEL  = int(os.environ.get("IMMICH_VIDEO_PARALLEL", "2"))
-LARGE_FILE_MB   = int(os.environ.get("IMMICH_LARGE_MB", "99"))
+LARGE_FILE_MB       = int(os.environ.get("IMMICH_LARGE_MB", "99"))
+VIDEO_LARGE_FILE_MB = int(os.environ.get("IMMICH_VIDEO_LARGE_MB", "4096"))  # 4 GB default
 PROGRESS_INTERVAL = 50
 NAS_MOUNT_POINT = os.environ.get("NAS_MOUNT_POINT", "/Volumes/nas")
 
@@ -204,10 +208,12 @@ def load_failures() -> set:
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
-def find_media_files(extensions=MEDIA_EXTENSIONS):
+def find_media_files(extensions=MEDIA_EXTENSIONS, with_video: bool = False):
     """Generator yielding absolute paths to media files filtered by extensions.
-    Skips files >= LARGE_FILE_MB. Walks PHOTOS_DIR on every call."""
-    large_bytes = LARGE_FILE_MB * 1024 * 1024
+    Skips files >= LARGE_FILE_MB (photos) or IMMICH_VIDEO_LARGE_MB (videos).
+    Walks PHOTOS_DIR on every call."""
+    cap_mb = VIDEO_LARGE_FILE_MB if with_video else LARGE_FILE_MB
+    cap_bytes = cap_mb * 1024 * 1024
     logger.info("Walking NAS: %s", PHOTOS_DIR)
     dirs_visited = 0
     for root, _dirs, files in os.walk(PHOTOS_DIR):
@@ -220,8 +226,8 @@ def find_media_files(extensions=MEDIA_EXTENSIONS):
                 continue
             full = os.path.join(root, fname)
             try:
-                if os.path.getsize(full) >= large_bytes:
-                    logger.warning("Skipping large file (>%dMB): %s", LARGE_FILE_MB, full)
+                if os.path.getsize(full) >= cap_bytes:
+                    logger.warning("Skipping large file (>%dMB): %s", cap_mb, full)
                     continue
             except OSError:
                 continue
@@ -252,6 +258,7 @@ def get_taken_at(path: str) -> str:
     return datetime.datetime.utcfromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+# Retained as test oracle for StreamingMultipart byte-identity verification.
 def build_multipart(fields: dict, file_path: str, mime: str) -> bytes:
     boundary = b"----immichboundary"
     body = b""
@@ -270,18 +277,100 @@ def build_multipart(fields: dict, file_path: str, mime: str) -> bytes:
     return body
 
 
-def get_conn() -> HTTPConnection:
-    """Return a thread-local persistent HTTPConnection, creating one if needed."""
+class StreamingMultipart:
+    """Streams multipart/form-data without loading the file into memory.
+
+    Provides a read() interface accepted by http.client.HTTPConnection.request()
+    and exposes content_length for the Content-Length header.
+    Content-Length is computed from file metadata so no file I/O occurs at
+    construction time.
+    """
+
+    BOUNDARY = b"----immichboundary"
+
+    def __init__(self, fields: dict, file_path: str, mime: str):
+        preamble = b""
+        for name, val in fields.items():
+            preamble += b"--" + self.BOUNDARY + b"\r\n"
+            preamble += f'Content-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode()
+        fname = os.path.basename(file_path)
+        preamble += b"--" + self.BOUNDARY + b"\r\n"
+        preamble += (
+            f'Content-Disposition: form-data; name="assetData"; filename="{fname}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode()
+        epilogue = b"\r\n--" + self.BOUNDARY + b"--\r\n"
+
+        self._preamble = preamble
+        self._epilogue = epilogue
+        self._file_path = file_path
+        self.content_length = len(preamble) + os.path.getsize(file_path) + len(epilogue)
+
+        # Stream state — lazily initialised on first read()
+        self._parts = None
+        self._part_idx = 0
+
+    def _init(self):
+        self._parts = [
+            io.BytesIO(self._preamble),
+            open(self._file_path, "rb"),
+            io.BytesIO(self._epilogue),
+        ]
+
+    def read(self, size: int = 65536) -> bytes:
+        if self._parts is None:
+            self._init()
+        buf = b""
+        while len(buf) < size and self._part_idx < len(self._parts):
+            chunk = self._parts[self._part_idx].read(size - len(buf))
+            if chunk:
+                buf += chunk
+            else:
+                self._parts[self._part_idx].close()
+                self._part_idx += 1
+        return buf
+
+    def close(self):
+        """Close any open part handles (called on upload failure to prevent fd leaks)."""
+        if self._parts:
+            for part in self._parts[self._part_idx:]:
+                try:
+                    part.close()
+                except Exception:
+                    pass
+            self._parts = None
+
+
+def compute_upload_timeout(file_size_bytes: int) -> int:
+    """Return a connection timeout in seconds: 1 second per MB + 60 second base.
+
+    Assumes a conservative minimum throughput of 1 MB/s over local network.
+    Minimum is 60 seconds.
+    """
+    mb = file_size_bytes / (1024 * 1024)
+    return max(60, int(mb) + 60)
+
+
+def get_conn(timeout: int = 60) -> HTTPConnection:
+    """Return a thread-local persistent HTTPConnection, creating one if needed.
+    Recreates the connection if the required timeout differs from the current one."""
     parsed = urlparse(IMMICH_URL)
     host = parsed.hostname
     port = parsed.port or 80
-    if not getattr(_local, "conn", None):
-        _local.conn = HTTPConnection(host, port, timeout=60)
+    if not getattr(_local, "conn", None) or getattr(_local, "conn_timeout", 60) != timeout:
+        old = getattr(_local, "conn", None)
+        if old:
+            try:
+                old.close()
+            except Exception:
+                pass
+        _local.conn = HTTPConnection(host, port, timeout=timeout)
+        _local.conn_timeout = timeout
     return _local.conn
 
 
 def upload(file_path: str) -> tuple:
-    """Upload one file. Returns (status_str, relative_path)."""
+    """Upload one file using streaming multipart. Returns (status_str, relative_path)."""
     prefix = PHOTOS_DIR.rstrip("/") + "/"
     rel = file_path[len(prefix):] if file_path.startswith(prefix) else file_path
 
@@ -298,24 +387,28 @@ def upload(file_path: str) -> tuple:
         "fileModifiedAt": taken_at,
         "isFavorite": "false",
     }
+
     try:
-        body = build_multipart(fields, file_path, mime)
-    except Exception as e:
+        file_size = os.path.getsize(file_path)
+    except OSError as e:
         logger.warning("read failed %s: %s", rel, e)
         return ("failed:read error", rel)
 
-    ctype = "multipart/form-data; boundary=----immichboundary"
+    timeout = compute_upload_timeout(file_size)
+    ctype = "multipart/form-data; boundary=" + StreamingMultipart.BOUNDARY.decode()
     api_key = os.environ.get("IMMICH_API_KEY", "")
+
     for attempt in range(3):
+        mp = StreamingMultipart(fields, file_path, mime)
         try:
-            conn = get_conn()
+            conn = get_conn(timeout=timeout)
             conn.request(
-                "POST", "/api/assets", body=body,
+                "POST", "/api/assets", body=mp,
                 headers={
                     "x-api-key": api_key,
                     "Content-Type": ctype,
                     "Accept": "application/json",
-                    "Content-Length": str(len(body)),
+                    "Content-Length": str(mp.content_length),
                 },
             )
             resp = conn.getresponse()
@@ -323,6 +416,7 @@ def upload(file_path: str) -> tuple:
             rbody = resp.read().decode("utf-8", errors="replace")
             break
         except Exception:
+            mp.close()
             _local.conn = None
             if attempt == 2:
                 logger.warning("%s — connection failed after 3 attempts", rel)
@@ -373,16 +467,17 @@ def run_import(mode: str, with_video: bool = False) -> bool:
 
     created = dupes = failed = processed = 0
 
+    file_size_cap_mb = VIDEO_LARGE_FILE_MB if with_video else LARGE_FILE_MB
     if mode == "test":
         logger.info("Test mode: uploading first %d %s files...", TEST_COUNT, media_type)
     else:
         logger.info(
             "Full import | media=%s | %d parallel uploads | skipping files >%dMB | progress every %d files",
-            media_type, workers, LARGE_FILE_MB, PROGRESS_INTERVAL,
+            media_type, workers, file_size_cap_mb, PROGRESS_INTERVAL,
         )
 
     # Build file source
-    all_files = find_media_files(extensions)
+    all_files = find_media_files(extensions, with_video=with_video)
 
     if mode == "test":
         source = itertools.islice(all_files, TEST_COUNT)
@@ -478,6 +573,11 @@ def usage():
 
 def main():
     setup_logging()
+
+    # Write PID file so recover.sh can detect this process reliably on macOS
+    pid_file = SCRIPT_DIR / "import.pid"
+    pid_file.write_text(str(os.getpid()))
+    atexit.register(lambda: pid_file.unlink(missing_ok=True))
 
     args = set(sys.argv[1:])
     unknown = args - {"--test", "--all", "--withvideo", "--failures"}

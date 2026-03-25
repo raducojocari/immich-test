@@ -177,9 +177,11 @@ immich-test/
 - Checkpoint is derived from `import.log` — no separate state file that can get out of sync.
 - Checkpoint uses O(n+m) Python set filter: loads done-set once, streams find output — avoids
   re-reading all 151k NAS file paths for each lookup.
-- **External recovery via `recover.sh`**: runs every 10 minutes via cron. Checks health and,
-  if anything is broken, stops the import, force-unmounts the NAS, remounts, restarts Docker,
-  waits for Immich healthy, then relaunches `import.py --all`. The checkpoint log ensures
+- **External recovery via `recover.sh`**: runs every 10 minutes via cron. Uses a 2-branch
+  decision model: if all 4 health conditions pass (import running, Immich healthy, NAS mounted,
+  checkpoint fresh), skip. If **any** condition fails, trigger full recovery: stop import,
+  docker compose down, force-unmount NAS, remount, docker compose up, wait for Immich healthy
+  (120s timeout), relaunch import. No partial or targeted fixes. The checkpoint log ensures
   import resumes from where it left off on every restart.
 - `import.py` is intentionally a simple single-pass uploader with no self-healing threads.
   This eliminates the structural problem of a Python process trying to recover itself while
@@ -205,13 +207,11 @@ immich-test/
 ### NFR-5: Performance
 - Pure-Python streaming pipeline (`import.py`): no per-file subprocess spawns (no bash/curl/python3
   child processes), no TCP handshake overhead (thread-local persistent `HTTPConnection`).
-- Streaming generator pipeline: `find_media_files → checkpoint filter → prechecker → ThreadPoolExecutor`;
-  uploads start as soon as the first 50-file prechecker batch completes (~10 s).
+- Streaming generator pipeline: `find_media_files → checkpoint filter → ThreadPoolExecutor`;
+  uploads start as soon as the first file passes the filter.
 - MIME type detection is purely extension-based (no `file --mime-type` subprocess per file).
-- Test mode skips checkpoint filter and prechecker entirely — Immich's `deviceAssetId`-based
+- Test mode skips checkpoint filter entirely — Immich's `deviceAssetId`-based
   deduplication handles already-uploaded files natively, avoiding a slow NFS scan on short runs.
-- Prechecker SHA1-hashes files in parallel (6 threads via `ThreadPoolExecutor`) and uses small
-  batches (default 50) so the first uploads start within ~10 sec of launch.
 
 ### NFR-6: Observability
 - All script output uses prefixed log levels: `[INFO]`, `[OK]`, `[SKIP]`, `[WARN]`, `[ERROR]`, `[PROGRESS]`.
@@ -228,93 +228,190 @@ immich-test/
 
 ```mermaid
 graph TD
-    NAS["Unifi NAS\n192.168.1.253\n/Volumes/nas"]
-    PHOTOS["Google Photos\n~151k files"]
-    IMMICH_STORAGE["Immich Storage\n/Volumes/nas/immich"]
-    DOCKER["Docker Desktop"]
-    SERVER["immich-server\n:2283"]
-    ML["immich-machine-learning"]
-    PG["postgres\n(pgvector)"]
-    REDIS["valkey (redis)"]
-    SCRIPT["import.py\nPython 3"]
+    subgraph MacBook["MacBook Pro (M1 Pro)"]
+        RECOVER["recover.sh\ncron */10 min"]
+        SCRIPT["import.py\nPython 3"]
+        INSTALL["install.sh"]
+        MOUNT["mount.sh"]
+        START["start.sh"]
+        STOP["stop.sh"]
+        RESET["reset.sh"]
+        subgraph Docker["Docker Desktop"]
+            SERVER["immich-server\n:2283"]
+            ML["immich-machine-learning"]
+            PG["postgres\n(pgvector)"]
+            REDIS["valkey/redis"]
+        end
+    end
+
+    subgraph NAS["Unifi NAS (192.168.1.253)"]
+        PHOTOS["Google Photos\n~151k files"]
+        IMMICH_STORAGE["Immich Storage\n/Volumes/nas/immich"]
+    end
+
     BROWSER["Web Browser\nhttp://localhost:2283"]
 
-    NAS --> PHOTOS
-    NAS --> IMMICH_STORAGE
-    DOCKER --> SERVER
-    DOCKER --> ML
-    DOCKER --> PG
-    DOCKER --> REDIS
-    SERVER --> IMMICH_STORAGE
-    SCRIPT -->|"POST /api/assets\n(multipart)"| SERVER
-    SCRIPT -->|"os.walk"| PHOTOS
-    BROWSER --> SERVER
+    RECOVER -->|"health check\ncurl /api/server/ping"| SERVER
+    RECOVER -->|"start/stop"| SCRIPT
+    RECOVER -->|"docker compose\nup/down"| Docker
+    RECOVER -->|"diskutil unmount +\nsudo mount.sh"| NAS
+
+    SCRIPT -->|"POST /api/assets\nmultipart HTTP"| SERVER
+    SCRIPT -->|"os.walk + read"| PHOTOS
+
+    INSTALL -->|"curl GitHub releases"| Docker
+    INSTALL -->|"mkdir immich/"| IMMICH_STORAGE
+    MOUNT -->|"NFS v3\nresvport"| NAS
+
+    START -->|"docker compose up -d"| Docker
+    STOP -->|"docker compose down"| Docker
+    RESET -->|"rm -rf"| IMMICH_STORAGE
+    RESET -->|"docker compose down"| Docker
+
+    SERVER -->|"read/write uploads"| IMMICH_STORAGE
+    SERVER --> ML
+    SERVER --> PG
+    SERVER --> REDIS
+    BROWSER -->|"HTTP :2283"| SERVER
 ```
 
-### Normal Import Flow
+### Installation Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Install as install.sh
+    participant Mount as mount.sh
+    participant NAS as Unifi NAS
+    participant GitHub
+    participant Docker
+
+    User->>Mount: sudo ./mount.sh
+    Mount->>Mount: check if already root
+    alt Not root
+        Mount->>Mount: exec sudo $0 (re-invoke as root)
+    end
+    Mount->>NAS: ping -c 1 -t 2 192.168.1.253
+    alt NAS unreachable
+        Mount-->>User: ERROR Cannot reach NAS
+    else NAS reachable
+        Mount->>NAS: showmount -e (check NFS whitelist)
+        Mount->>NAS: mount -t nfs -o resvport
+        Mount-->>User: NAS mounted at /Volumes/nas
+    end
+
+    User->>Install: ./install.sh
+    Install->>Install: check_prerequisites (docker, curl)
+    Install->>Install: check_nas_mounted (/Volumes/nas exists)
+    Install->>NAS: mkdir -p /Volumes/nas/immich
+    Install->>GitHub: curl docker-compose.yml
+    Install->>GitHub: curl example.env
+    Install->>Install: configure .env (UPLOAD_LOCATION, DB_DATA_LOCATION)
+    Install->>Install: create docker-compose.override.yml (NAS volume mount)
+    Install->>Install: setup_sudoers (passwordless sudo for mount.sh)
+    Install->>Docker: docker compose up --detach
+    Install-->>User: Immich running at http://localhost:2283
+```
+
+### Photo Import Flow
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Script as import.py
-    participant NAS
-    participant Immich
+    participant Checkpoint as import.log
+    participant NAS as NAS (Google Photos)
+    participant Immich as immich-server
 
-    User->>Script: python3 import.py --all
-    Script->>Immich: check_prerequisites() + check_immich_reachable()
-    Script->>NAS: os.walk (find_media_files)
-    Script->>Script: load_checkpoint() → skip already done
-    loop For each file batch (workers × 3)
-        Script->>NAS: read file
-        Script->>Immich: POST /api/assets
-        Immich-->>Script: 201 created / 200 duplicate / error
-        Script->>Script: log_checkpoint(CREATED|DUPLICATE|FAILED)
+    User->>Script: IMMICH_API_KEY=key python3 import.py --all
+    Script->>Script: setup_logging (clear logs/import.log)
+    Script->>Script: check_prerequisites (API key + photos dir)
+    Script->>Immich: GET /api/server/ping (retry 12x5s)
+    alt Immich unreachable after 60s
+        Script-->>User: ERROR Cannot reach Immich
+    else Immich healthy
+        Script->>Immich: GET /api/users/me (validate API key)
     end
-    Script->>User: === Import complete ===
+
+    Script->>Checkpoint: load_checkpoint() - parse CREATED/DUPLICATE entries
+    Script->>NAS: os.walk (find_media_files generator)
+    Note over Script: Filter: extension match + size < 99MB + not in checkpoint
+
+    loop ThreadPoolExecutor (sliding window of workers x 3 futures)
+        Script->>NAS: read file + read .json sidecar
+        Script->>Script: build_multipart (in-memory)
+        Script->>Immich: POST /api/assets (thread-local HTTPConnection)
+        alt HTTP 200/201
+            Immich-->>Script: created or duplicate
+            Script->>Checkpoint: log CREATED or DUPLICATE
+        else HTTP error
+            Immich-->>Script: error response
+            Script->>Checkpoint: log FAILED + reason
+            Note over Script: Retries connection up to 3x per file
+        end
+        Note over Script: Print progress every 50 files
+    end
+
+    Script-->>User: Import complete (imported / dupes / failed / elapsed)
 ```
 
-### External Recovery Flow (`recover.sh` cron agent)
+### Automated Recovery Flow (`recover.sh` cron agent)
 
-`recover.sh` runs every 10 minutes via cron. It makes a single health decision and acts accordingly.
+`recover.sh` runs every 10 minutes via cron. It uses a simple 2-branch decision model:
+any anomaly triggers full recovery; there are no targeted or partial fixes.
 
 **Decision logic:**
 
 | Condition | Action |
 |---|---|
-| import running + Immich healthy + checkpoint age < 720 s | Skip — all healthy |
-| import NOT running + Immich healthy | Start import only (no Docker restart) |
-| anything else | Full recovery |
+| import running AND Immich healthy AND NAS mounted AND checkpoint age < 720s | Skip -- all healthy |
+| **Anything else** (any single condition fails) | **Full recovery** |
 
-**Full recovery sequence:** stop import → `docker compose down` → `diskutil unmount force` → `mount.sh` → `docker compose up -d` → wait for Immich healthy → start import.
+**Full recovery sequence:** stop import --> docker compose down --> diskutil force-unmount --> mount.sh --> docker compose up -d --> wait for Immich (120s timeout) --> start import.
 
 ```mermaid
 sequenceDiagram
     participant Cron as cron (*/10 * * * *)
     participant Recover as recover.sh
     participant Import as import.py
-    participant NAS
-    participant Docker
-    participant Immich
+    participant Docker as Docker Compose
+    participant NAS as Unifi NAS
+    participant Immich as immich-server
 
     Cron->>Recover: execute recover.sh
-    Recover->>Recover: acquire PID lock (/tmp/immich_recover.lock)
-    Recover->>Recover: health check (pgrep + curl + stat)
 
-    alt All healthy
-        Recover->>Recover: log "All healthy — skipping"
-    else Import not running, Immich healthy
-        Recover->>Import: nohup python3 import.py --all &
-    else Unhealthy
-        Recover->>Import: SIGTERM → wait 15s → SIGKILL
-        Recover->>Docker: docker compose --project-directory install/ down
-        Recover->>NAS: sudo diskutil unmount force /Volumes/nas
-        Recover->>NAS: sudo mount.sh
-        Recover->>Docker: docker compose --project-directory install/ up -d
-        Recover->>Immich: poll /api/server/ping (24×5s)
-        Recover->>Import: nohup python3 import.py --all &
+    Recover->>Recover: acquire PID lock (/tmp/immich_recover.lock)
+    alt Lock held by live process
+        Recover->>Recover: log "Already running" and exit 0
+    else No lock or stale lock
+        Recover->>Recover: write PID to lock file
     end
 
-    Recover->>Recover: release PID lock
+    Note over Recover: Health check: 4 conditions
+    Recover->>Recover: pgrep import.py (import running?)
+    Recover->>Immich: curl /api/server/ping (Immich healthy?)
+    Recover->>Recover: mount | grep /Volumes/nas (NAS mounted?)
+    Recover->>Recover: stat import.log (checkpoint age < 720s?)
+
+    alt ALL 4 conditions pass
+        Recover->>Recover: log "All healthy -- skipping"
+    else ANY condition fails
+        Note over Recover: Full recovery -- no partial fixes
+        Recover->>Import: stop_import (SIGTERM, wait 15s, SIGKILL)
+        Recover->>Docker: docker compose down
+        Recover->>NAS: sudo diskutil unmountDisk force /Volumes/nas
+        Recover->>NAS: sudo mount.sh (NFS remount)
+        Recover->>Docker: docker compose up --detach
+        Recover->>Immich: poll /api/server/ping (24 x 5s = 120s timeout)
+        alt Immich healthy within 120s
+            Recover->>Import: nohup python3 import.py --all &
+            Recover->>Recover: log "FULL RECOVERY complete"
+        else Timeout
+            Recover->>Recover: log ERROR + exit 1
+        end
+    end
+
+    Recover->>Recover: release PID lock (trap EXIT)
 ```
 
 #### recover.sh details
@@ -325,10 +422,10 @@ sequenceDiagram
 | Setup | `./output/recover.sh --setup` installs cron entry + sudoers for diskutil |
 | PID lock | `/tmp/immich_recover.lock` — prevents concurrent recovery runs |
 | API key | Sourced from `output/.env.local` (bash 3.2-compatible line reader) |
-| Checkpoint age | `stat -f '%m'` on `import.log`; missing or empty → 99999 s (treated as stale) |
+| Checkpoint age | `stat -f '%m'` on `import.log`; missing file → mtime 0, so age equals current epoch (~huge), treated as stale |
 | Stale threshold | 720 s (12 minutes) — slightly more than the 10-minute cron interval |
-| NAS unmount | `sudo diskutil unmount force` — uses DiskArbitration, non-blocking on macOS even when NFS is frozen |
-| Sudoers | `${USER} ALL=(root) NOPASSWD: /usr/sbin/diskutil` written to `/etc/sudoers.d/immich-recover` |
+| NAS unmount | `sudo diskutil unmountDisk force` — uses DiskArbitration, non-blocking on macOS even when NFS is frozen |
+| Sudoers | `${USER} ALL=(root) NOPASSWD: /usr/sbin/diskutil, <script_dir>/mount.sh` written to `/etc/sudoers.d/immich_recover` |
 | Log | `output/logs/recover.log` — rolling (not cleared on each run) |
 
 ## 8. Import Pipeline
@@ -357,7 +454,7 @@ Each `upload()` call (runs in thread pool):
 4. POSTs via thread-local persistent `HTTPConnection` (no TCP handshake per file)
 5. Retries up to 3× on connection error, reconnecting each time
 
-**--test mode**: skips checkpoint filter and prechecker; takes first `TEST_COUNT` paths
+**--test mode**: skips checkpoint filter; takes first `TEST_COUNT` paths
 directly from `find_media_files()`. Immich native dedup handles already-uploaded files.
 
 ---

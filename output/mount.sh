@@ -10,8 +10,13 @@ MOUNT_POINT="/Volumes/nas"
 info()  { echo "[INFO]  $*"; }
 error() { echo "[ERROR] $*" >&2; exit 1; }
 
-# Re-invoke with sudo if not already running as root
-if [[ "${EUID}" -ne 0 ]]; then
+# Allow mock binary injection for tests (must come before EUID check so mocks are in PATH
+# when the script re-invokes itself; MOCK_BIN_DIR is exported so sudo inherits it)
+export PATH="${MOCK_BIN_DIR:+${MOCK_BIN_DIR}:}${PATH}"
+
+# Re-invoke with sudo if not already running as root.
+# MOUNT_TEST_MODE bypasses this so BATS tests can run without real sudo.
+if [[ "${EUID}" -ne 0 ]] && [[ -z "${MOUNT_TEST_MODE:-}" ]]; then
     exec sudo "$0" "$@"
 fi
 
@@ -44,7 +49,7 @@ check_client_allowed() {
 check_client_allowed
 
 info "Mounting ${NAS_HOST}:${NAS_EXPORT} at ${MOUNT_POINT}..."
-mount -t nfs -o resvport "${NAS_HOST}:${NAS_EXPORT}" "${MOUNT_POINT}" \
+mount -t nfs -o resvport,soft,timeo=50,retrans=2 "${NAS_HOST}:${NAS_EXPORT}" "${MOUNT_POINT}" \
     || error "Mount failed. Check NFS is enabled on the NAS and this machine has access."
 
 info "NAS mounted successfully at ${MOUNT_POINT}."

@@ -605,5 +605,162 @@ class TestRunImportFailuresMode(unittest.TestCase):
         self.assertTrue(result)
 
 
+# ---------------------------------------------------------------------------
+# 8. StreamingMultipart
+# ---------------------------------------------------------------------------
+class TestStreamingMultipart(unittest.TestCase):
+
+    def _make_file(self, content: bytes):
+        """Write content to a temp file and return its path (caller must unlink)."""
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        fh.write(content)
+        fh.close()
+        return fh.name
+
+    def test_content_length_matches_actual_bytes(self):
+        """content_length equals the number of bytes read() returns in total."""
+        data = b"x" * 1024
+        path = self._make_file(data)
+        try:
+            mp = m.StreamingMultipart(
+                {"deviceAssetId": "test.mp4", "isFavorite": "false"},
+                path, "video/mp4"
+            )
+            collected = b""
+            while True:
+                chunk = mp.read(256)
+                if not chunk:
+                    break
+                collected += chunk
+            self.assertEqual(len(collected), mp.content_length)
+        finally:
+            os.unlink(path)
+
+    def test_streaming_produces_same_bytes_as_build_multipart(self):
+        """StreamingMultipart output is byte-identical to build_multipart output."""
+        data = b"video data here"
+        path = self._make_file(data)
+        try:
+            fields = {"deviceAssetId": "test.mp4", "isFavorite": "false"}
+            expected = m.build_multipart(fields, path, "video/mp4")
+            mp = m.StreamingMultipart(fields, path, "video/mp4")
+            actual = b""
+            while True:
+                chunk = mp.read(64)
+                if not chunk:
+                    break
+                actual += chunk
+            self.assertEqual(actual, expected)
+        finally:
+            os.unlink(path)
+
+    def test_small_read_size_assembles_correctly(self):
+        """Reading in 1-byte chunks still produces the full correct output."""
+        data = b"abc"
+        path = self._make_file(data)
+        try:
+            fields = {"deviceAssetId": "f.mp4", "isFavorite": "false"}
+            expected = m.build_multipart(fields, path, "video/mp4")
+            mp = m.StreamingMultipart(fields, path, "video/mp4")
+            actual = b""
+            while True:
+                chunk = mp.read(1)
+                if not chunk:
+                    break
+                actual += chunk
+            self.assertEqual(actual, expected)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 9. compute_upload_timeout
+# ---------------------------------------------------------------------------
+class TestComputeUploadTimeout(unittest.TestCase):
+
+    def test_small_file_returns_minimum_60(self):
+        """Files under 1 MB → minimum timeout of 60 seconds (int(mb)=0, so 0+60=60)."""
+        self.assertEqual(m.compute_upload_timeout(1024), 60)
+        self.assertEqual(m.compute_upload_timeout(500 * 1024), 60)
+
+    def test_large_file_scales_with_size(self):
+        """1 GB file → timeout > 60 seconds."""
+        one_gb = 1024 * 1024 * 1024
+        self.assertGreater(m.compute_upload_timeout(one_gb), 60)
+        self.assertEqual(m.compute_upload_timeout(one_gb), 1024 + 60)
+
+    def test_timeout_formula(self):
+        """Timeout = 1s per MB + 60s base."""
+        mb_200 = 200 * 1024 * 1024
+        self.assertEqual(m.compute_upload_timeout(mb_200), 200 + 60)
+
+
+# ---------------------------------------------------------------------------
+# 10. Video size cap (IMMICH_VIDEO_LARGE_MB)
+# ---------------------------------------------------------------------------
+class TestVideoSizeCap(unittest.TestCase):
+
+    def test_video_mode_uses_video_cap(self):
+        """In video mode, files > IMMICH_VIDEO_LARGE_MB are skipped."""
+        with tempfile.TemporaryDirectory() as td:
+            mp4 = os.path.join(td, "clip.mp4")
+            with open(mp4, "wb") as f:
+                f.write(b"\x00" * 10)
+            with patch.object(m, "PHOTOS_DIR", td):
+                with patch.object(m, "VIDEO_LARGE_FILE_MB", 1):
+                    with patch("os.path.getsize", return_value=2 * 1024 * 1024):
+                        results = list(m.find_media_files(m.VIDEO_EXTENSIONS, with_video=True))
+            self.assertEqual(results, [])
+
+    def test_video_mode_allows_files_under_video_cap(self):
+        """In video mode, files < IMMICH_VIDEO_LARGE_MB are included."""
+        with tempfile.TemporaryDirectory() as td:
+            mp4 = os.path.join(td, "clip.mp4")
+            with open(mp4, "wb") as f:
+                f.write(b"\x00" * 10)
+            with patch.object(m, "PHOTOS_DIR", td):
+                with patch.object(m, "VIDEO_LARGE_FILE_MB", 100):
+                    with patch("os.path.getsize", return_value=50 * 1024 * 1024):
+                        results = list(m.find_media_files(m.VIDEO_EXTENSIONS, with_video=True))
+            self.assertIn(mp4, results)
+
+    def test_photo_mode_unaffected_by_video_cap(self):
+        """Changing VIDEO_LARGE_FILE_MB has no effect on photo mode."""
+        with tempfile.TemporaryDirectory() as td:
+            jpg = os.path.join(td, "photo.jpg")
+            with open(jpg, "wb") as f:
+                f.write(b"\x00" * 10)
+            with patch.object(m, "PHOTOS_DIR", td):
+                with patch.object(m, "LARGE_FILE_MB", 99):
+                    with patch.object(m, "VIDEO_LARGE_FILE_MB", 1):
+                        with patch("os.path.getsize", return_value=50 * 1024 * 1024):
+                            results = list(m.find_media_files(m.PHOTO_EXTENSIONS, with_video=False))
+            self.assertIn(jpg, results)
+
+
+# ---------------------------------------------------------------------------
+# PID file
+# ---------------------------------------------------------------------------
+class TestPidFile(unittest.TestCase):
+
+    def test_pid_file_written_and_removed_on_exit(self):
+        """main() writes import.pid with the current PID and removes it via atexit."""
+        import pathlib
+        with tempfile.TemporaryDirectory() as td:
+            pid_path = pathlib.Path(td) / "import.pid"
+            with patch.object(m, "SCRIPT_DIR", pathlib.Path(td)), \
+                 patch.object(m, "setup_logging"), \
+                 patch.object(m, "check_prerequisites"), \
+                 patch.object(m, "check_immich_reachable"), \
+                 patch.object(m, "run_import", return_value=True), \
+                 patch("sys.argv", ["import.py", "--all"]), \
+                 patch("sys.exit"):
+                m.main()
+            # After main() returns, atexit has NOT been fired yet in this test —
+            # just verify the file was written with the correct PID
+            self.assertTrue(pid_path.exists(), "import.pid was not created")
+            self.assertEqual(pid_path.read_text().strip(), str(os.getpid()))
+
+
 if __name__ == "__main__":
     unittest.main()

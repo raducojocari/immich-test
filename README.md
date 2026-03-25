@@ -8,12 +8,12 @@ Automated pipeline to migrate a Google Photos Takeout archive into a self-hosted
 
 ```bash
 # One-time setup
-sudo ./output/mount.sh                         # mount NAS at /Volumes/nas
-./output/install.sh                            # download + configure Immich
+sudo ./output/mount.sh                           # mount NAS at /Volumes/nas
+./output/install.sh                              # download + configure Immich
 echo "IMMICH_API_KEY=<key>" > output/.env.local  # API key for recover.sh
-./output/recover.sh --setup                    # install cron (*/10 min) + sudoers (asks sudo once)
+./output/recover.sh --setup                      # configure sudoers for NAS operations (asks sudo once)
 
-# First run (starts Docker + begins import; cron keeps it running automatically)
+# Start the recovery monitor (foreground loop; keep this terminal open)
 ./output/recover.sh
 ```
 
@@ -25,10 +25,13 @@ echo "IMMICH_API_KEY=<key>" > output/.env.local  # API key for recover.sh
 |---|---|
 | `sudo ./output/mount.sh` | Mount NAS via NFS at `/Volumes/nas` |
 | `./output/install.sh` | Download and configure Immich Docker stack |
-| `./output/recover.sh --setup` | Install cron entry + sudoers for automated recovery |
-| `./output/recover.sh` | Health-check; trigger full recovery if needed |
+| `./output/recover.sh --setup` | Configure sudoers for NAS operations (run once) |
+| `./output/recover.sh` | Start foreground recovery monitor (checks every 2 min) |
+| `./output/recover.sh --once` | Run a single health check and exit |
 | `IMMICH_API_KEY=<key> python3 output/import.py --test` | Import 5 sample photos (verify setup) |
 | `IMMICH_API_KEY=<key> python3 output/import.py --all` | Import all photos (resumable) |
+| `IMMICH_API_KEY=<key> python3 output/import.py --all --withvideo` | Import all videos (resumable) |
+| `IMMICH_API_KEY=<key> python3 output/import.py --test --withvideo` | Import 5 sample videos (verify setup) |
 | `IMMICH_API_KEY=<key> python3 output/import.py --failures` | Retry only previously failed files |
 | `IMMICH_API_KEY=<key> python3 output/repair.py` | Re-trigger thumbnail generation for broken assets |
 | `./output/start.sh` | Start Immich Docker stack manually |
@@ -41,7 +44,7 @@ echo "IMMICH_API_KEY=<key>" > output/.env.local  # API key for recover.sh
 ## How It Works
 
 - **`import.py`** — single-pass uploader. Reads Google Photos Takeout files from NAS, uploads to Immich via REST API. Writes `output/import.log` as a checkpoint; safe to kill and re-run.
-- **`recover.sh`** — cron agent (runs every 10 min). Checks if the import is running and Immich is healthy. If not, performs full recovery: stops import → unmounts NAS → remounts → restarts Docker → waits for Immich → relaunches import.
+- **`recover.sh`** — foreground recovery monitor (checks every 2 min). If import is running, Immich is healthy, NAS is mounted, and the checkpoint log is recent → skip. Any anomaly → full recovery: stops import → unmounts NAS → remounts → restarts Docker → waits for Immich → relaunches import.
 - **Checkpoint**: `import.log` records every `CREATED`/`DUPLICATE` outcome. On restart, already-processed files are skipped in O(n) time.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system documentation and diagrams.
@@ -56,7 +59,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system documentation and diagram
 | `output/install/.env` | Immich config (paths, DB credentials) — written by `install.sh` |
 | `output/install/docker-compose.override.yml` | Resource limits and NAS volume mount |
 
-Key env vars for `import.py`: `IMMICH_PARALLEL` (default 10), `IMMICH_LARGE_MB` (default 99 MB), `IMMICH_TEST_COUNT` (default 5).
+Key env vars for `import.py`: `IMMICH_PARALLEL` (default 10), `IMMICH_VIDEO_PARALLEL` (default 2), `IMMICH_LARGE_MB` (default 99 MB), `IMMICH_VIDEO_LARGE_MB` (default 4096 MB), `IMMICH_TEST_COUNT` (default 5). For `recover.sh`: `IMMICH_WITH_VIDEO=true` restarts the import in video mode after recovery (add to `.env.local`).
 
 ---
 
